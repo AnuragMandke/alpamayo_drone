@@ -1,0 +1,26 @@
+# Core
+torch>=2.2.0
+torchvision>=0.17.0
+transformers>=4.40.0
+accelerate>=0.29.0
+peft>=0.10.0              # reference only; we implement LoRA ourselves
+
+# Quantization (QLoRA)
+bitsandbytes>=0.43.0
+
+# Data
+numpy>=1.26.0
+Pillow>=10.0.0
+PyYAML>=6.0
+
+# Training utilities
+einops>=0.7.0
+
+# Logging (optional)
+wandb>=0.17.0
+
+# AirSim online eval (optional — only needed for --mode online)
+# airsim>=1.8.1           # uncomment when running live simulator
+
+# Dev
+tqdm>=4.66.0

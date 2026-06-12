@@ -1,0 +1,77 @@
+# Smoke-test config: identical pipeline to default.yaml, but a tiny local
+# backbone (no 14GB OpenVLA download) and 2 epochs. Used only to verify
+# imports, data flow, and that the CFM loss decreases.
+
+model:
+  base_model_id: "data/tiny_backbone"   # tiny-random-Llama saved locally
+  load_in_4bit: false
+
+  vit_model: "google/vit-base-patch16-224"
+  vit_freeze: true
+
+  freeze_first_n_layers: 1
+
+  lora:
+    rank: 4
+    alpha: 8
+    dropout: 0.05
+    target_modules:
+      - "q_proj"
+      - "v_proj"
+      - "k_proj"
+      - "o_proj"
+
+  flow_matching:
+    action_dim: 4
+    hidden_dim: 64
+    num_layers: 2
+    num_heads: 4
+    num_diffusion_steps: 8
+    num_train_steps: 100
+    sigma_min: 0.001
+
+data:
+  dataset_root: "data/airsim"
+  sequence_length: 8
+  image_size: 224
+  action_horizon: 4
+  train_split: 0.9
+  val_split: 0.1
+  num_workers: 0
+
+training:
+  output_dir: "outputs/smoke_test"
+  seed: 42
+
+  epochs: 2
+  batch_size: 8
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+
+  optimizer:
+    type: "adamw"
+    lr: 2.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+  scheduler:
+    type: "cosine_with_warmup"
+    warmup_steps: 10
+    min_lr_ratio: 0.1
+
+  bf16: true
+
+  save_every_n_epochs: 2
+  keep_best_n: 3
+
+eval:
+  airsim_ip: "127.0.0.1"
+  airsim_port: 41451
+  n_episodes: 20
+  tasks:
+    - "point_nav"
+    - "obstacle_avoidance"
+    - "hover_stabilize"
+  point_nav_success_dist_m: 2.0
+  hover_success_drift_m: 0.5
+  max_episode_steps: 500

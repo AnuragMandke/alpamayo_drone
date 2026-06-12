@@ -1,0 +1,85 @@
+model:
+  # Base model — OpenVLA-7B (public) used as Alpamayo-R1 proxy
+  base_model_id: "openvla/openvla-7b"
+  load_in_4bit: true               # QLoRA: 4-bit base to fit on 12GB VRAM
+
+  # ViT encoder
+  vit_model: "google/vit-base-patch16-224"
+  vit_freeze: true                 # Freeze entire ViT
+
+  # Backbone freeze
+  freeze_first_n_layers: 12        # Freeze bottom 12 transformer layers
+
+  # LoRA
+  lora:
+    rank: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules:               # Inject into attention projections only
+      - "q_proj"
+      - "v_proj"
+      - "k_proj"
+      - "o_proj"
+
+  # FlowMatchingDecoder
+  flow_matching:
+    action_dim: 4                 # [vx, vy, vz, yaw_rate]  (m/s, m/s, m/s, rad/s)
+    hidden_dim: 512
+    num_layers: 4
+    num_heads: 8
+    num_diffusion_steps: 8        # DDIM steps at inference
+    num_train_steps: 100          # Training noise schedule steps
+    sigma_min: 0.001
+
+data:
+  dataset_root: "data/airsim"
+  sequence_length: 8              # Frames per training sample
+  image_size: 224
+  action_horizon: 4               # Predict 4 future actions
+  train_split: 0.9
+  val_split: 0.1
+  num_workers: 4
+
+training:
+  output_dir: "outputs"
+  seed: 42
+
+  epochs: 30
+  batch_size: 8                   # Per-GPU; effective 8 on single 3060
+  gradient_accumulation_steps: 4  # Effective batch = 32
+  max_grad_norm: 1.0
+
+  optimizer:
+    type: "adamw"
+    lr: 2.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+  scheduler:
+    type: "cosine_with_warmup"
+    warmup_steps: 200
+    min_lr_ratio: 0.1
+
+  # Mixed precision
+  bf16: true
+
+  # Checkpointing
+  save_every_n_epochs: 5
+  keep_best_n: 3
+
+eval:
+  # AirSim connection
+  airsim_ip: "127.0.0.1"
+  airsim_port: 41451
+
+  # Eval episodes per task
+  n_episodes: 20
+  tasks:
+    - "point_nav"                 # Navigate to GPS waypoint
+    - "obstacle_avoidance"        # Reach goal avoiding static obstacles
+    - "hover_stabilize"           # Hold position under wind disturbance
+
+  # Success thresholds
+  point_nav_success_dist_m: 2.0
+  hover_success_drift_m: 0.5
+  max_episode_steps: 500
