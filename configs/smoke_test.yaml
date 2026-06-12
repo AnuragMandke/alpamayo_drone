@@ -6,6 +6,7 @@ model:
   base_model_id: "data/tiny_backbone"   # tiny-random-Llama saved locally
   load_in_4bit: false
 
+  use_vision: true
   vit_model: "google/vit-base-patch16-224"
   vit_freeze: true
 

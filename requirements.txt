@@ -10,6 +10,7 @@ bitsandbytes>=0.43.0
 
 # Data
 numpy>=1.26.0
+scipy>=1.11.0             # UZH-FPV converter: pose → body-frame velocity
 Pillow>=10.0.0
 PyYAML>=6.0
 

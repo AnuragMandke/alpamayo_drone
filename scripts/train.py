@@ -86,6 +86,12 @@ def main():
         model.decoder.load_state_dict(
             torch.load(ckpt_dir / "decoder.pt", map_location=device)
         )
+        vision_ckpt = ckpt_dir / "vision.pt"
+        if getattr(model, "vis_proj", None) is not None and vision_ckpt.exists():
+            model.vis_proj.load_state_dict(
+                torch.load(vision_ckpt, map_location=device)
+            )
+            print("[Train] Restored vision projection")
 
     # ------------------------------------------------------------------
     # Data

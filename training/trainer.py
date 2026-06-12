@@ -129,6 +129,7 @@ class Trainer:
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
             actions = batch["actions"].to(self.device)
+            images = batch["images"].to(self.device)
 
             with torch.autocast(
                 device_type="cuda",
@@ -137,6 +138,7 @@ class Trainer:
                 out = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
+                    images=images,
                     actions_gt=actions,
                 )
                 loss = out["loss"] / self.grad_accum
@@ -175,6 +177,7 @@ class Trainer:
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 actions = batch["actions"].to(self.device)
+                images = batch["images"].to(self.device)
 
                 with torch.autocast(
                     device_type="cuda",
@@ -183,6 +186,7 @@ class Trainer:
                     out = self.model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
+                        images=images,
                         actions_gt=actions,
                     )
                 total_loss += out["loss"].item()
@@ -204,6 +208,11 @@ class Trainer:
         # Save decoder weights
         decoder_path = ckpt_dir / "decoder.pt"
         torch.save(self.model.decoder.state_dict(), decoder_path)
+
+        # Save the (trainable) vision projection; the ViT itself is frozen and
+        # restored from its pretrained weights, so it is not checkpointed.
+        if getattr(self.model, "vis_proj", None) is not None:
+            torch.save(self.model.vis_proj.state_dict(), ckpt_dir / "vision.pt")
 
         # Save metadata
         meta = {"epoch": epoch, "val_loss": val_loss, "global_step": self.global_step}

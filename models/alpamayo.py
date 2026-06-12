@@ -2,17 +2,24 @@
 alpamayo.py — Full Alpamayo-Drone model
 
 Architecture:
-    ViT encoder (frozen)  →  patch tokens
-    OpenVLA backbone      →  context embedding   (LoRA finetuned)
-    FlowMatchingDecoder   →  UAV action sequence  (fully trained)
+    ViT encoder (frozen)  →  per-frame visual tokens ┐
+                                                       ├→ fused context memory
+    OpenVLA backbone      →  text hidden states       ┘   (LoRA finetuned)
+    FlowMatchingDecoder   →  UAV action sequence           (fully trained)
 
-The backbone's causal LM head is discarded; instead the last-layer
-hidden states are passed as memory to the FlowMatchingDecoder.
+The backbone's causal LM head is discarded; instead its last-layer hidden
+states are concatenated with the projected ViT frame embeddings and passed
+together as cross-attention memory to the FlowMatchingDecoder. This makes the
+model an actual vision-language-action policy: the action head attends to both
+the instruction tokens and the observed image history.
+
+Set model.use_vision: false in the config to ablate the visual pathway and
+fall back to a text-only policy.
 """
 
 import torch
 import torch.nn as nn
-from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig, ViTModel
 from .flow_matching import FlowMatchingDecoder
 from .lora import inject_lora, count_trainable_params
 
@@ -79,12 +86,41 @@ class AlpamayoDrone(nn.Module):
             f"({stats['pct_trainable']:.2f}%)"
         )
 
-        # ------------------------------------------------------------------
-        # 3.  FlowMatchingDecoder (fully trainable)
-        # ------------------------------------------------------------------
         # Infer context_dim from backbone hidden size
         context_dim = self.backbone.config.hidden_size
 
+        # ------------------------------------------------------------------
+        # 2.5  Vision encoder (ViT) — frozen; one summary token per frame
+        # ------------------------------------------------------------------
+        self.use_vision = mc.get("use_vision", True)
+        if self.use_vision:
+            print(f"[Model] Loading vision encoder: {mc['vit_model']}")
+            self.vit = ViTModel.from_pretrained(
+                mc["vit_model"], torch_dtype=torch.bfloat16
+            )
+            if mc.get("vit_freeze", True):
+                for p in self.vit.parameters():
+                    p.requires_grad_(False)
+                # ViT-base has zero hidden/attention dropout, so leaving it in
+                # train() mode is numerically identical to eval(); we keep it
+                # frozen via requires_grad only.
+                print("[Model] Froze ViT encoder")
+            # Project each frame's CLS embedding into the backbone hidden size
+            # so visual tokens can be concatenated with text hidden states and
+            # consumed by the decoder's existing context_proj unchanged.
+            self.vis_proj = nn.Linear(self.vit.config.hidden_size, context_dim)
+            print(
+                f"[Model] Vision projection: "
+                f"{self.vit.config.hidden_size} -> {context_dim}"
+            )
+        else:
+            self.vit = None
+            self.vis_proj = None
+            print("[Model] use_vision=False — text-only policy")
+
+        # ------------------------------------------------------------------
+        # 3.  FlowMatchingDecoder (fully trainable)
+        # ------------------------------------------------------------------
         self.decoder = FlowMatchingDecoder(
             context_dim=context_dim,
             action_dim=fm["action_dim"],
@@ -124,21 +160,47 @@ class AlpamayoDrone(nn.Module):
 
     # ------------------------------------------------------------------
 
+    def _encode_frames(self, images: torch.Tensor, out_dtype: torch.dtype):
+        """
+        Encode an image history into one visual token per frame.
+
+        images: (B, S, 3, H, W)  →  (B, S, context_dim)
+        """
+        B, S = images.shape[:2]
+        flat = images.reshape(B * S, *images.shape[2:])       # (B*S, 3, H, W)
+        vit_dtype = next(self.vit.parameters()).dtype
+        vit_out = self.vit(pixel_values=flat.to(vit_dtype))
+        cls = vit_out.last_hidden_state[:, 0]                  # (B*S, vit_hidden)
+        cls = cls.reshape(B, S, -1).to(self.vis_proj.weight.dtype)
+        vis = self.vis_proj(cls)                              # (B, S, context_dim)
+        return vis.to(out_dtype)
+
     def encode_observation(
         self,
         input_ids: torch.Tensor,        # (B, seq_len)  tokenized obs + instruction
         attention_mask: torch.Tensor,   # (B, seq_len)
+        images: torch.Tensor = None,    # (B, S, 3, H, W)  frame history
     ) -> torch.Tensor:
         """
-        Run backbone forward pass, return last hidden states.
-        Shape: (B, seq_len, hidden_dim)
+        Run the backbone, then (if vision is enabled and images are provided)
+        prepend the projected per-frame ViT embeddings to the text hidden
+        states. The concatenation along the sequence axis becomes the decoder's
+        cross-attention memory.
+
+        Returns (B, S + seq_len, hidden_dim) with vision, else (B, seq_len, hidden_dim).
         """
         outputs = self.backbone(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
         )
-        return outputs.last_hidden_state   # (B, seq_len, hidden_dim)
+        text_ctx = outputs.last_hidden_state   # (B, seq_len, hidden_dim)
+
+        if self.use_vision and images is not None:
+            vis = self._encode_frames(images, out_dtype=text_ctx.dtype)
+            return torch.cat([vis, text_ctx], dim=1)
+
+        return text_ctx
 
     # ------------------------------------------------------------------
 
@@ -146,9 +208,10 @@ class AlpamayoDrone(nn.Module):
         self,
         input_ids: torch.Tensor,          # (B, seq_len)
         attention_mask: torch.Tensor,     # (B, seq_len)
+        images: torch.Tensor = None,      # (B, S, 3, H, W)  frame history
         actions_gt: torch.Tensor = None,  # (B, action_horizon, action_dim) — training only
     ) -> dict:
-        context = self.encode_observation(input_ids, attention_mask)
+        context = self.encode_observation(input_ids, attention_mask, images)
 
         if actions_gt is not None:
             loss = self.decoder.cfm_loss(actions_gt, context)

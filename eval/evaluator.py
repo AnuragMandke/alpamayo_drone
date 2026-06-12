@@ -48,10 +48,12 @@ class OfflineEvaluator:
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
             actions_gt = batch["actions"].to(self.device)   # (B, H, 4)
+            images = batch["images"].to(self.device)
 
             out = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                images=images,
                 actions_gt=None,    # inference mode
             )
             actions_pred = out["actions"]                    # (B, H, 4)
@@ -164,7 +166,10 @@ class AirSimOnlineEvaluator:
         img_1d = np.frombuffer(img_raw.image_data_uint8, dtype=np.uint8)
         img = img_1d.reshape(img_raw.height, img_raw.width, 3)
         img_pil = Image.fromarray(img)
-        img_tensor = IMAGE_TRANSFORM(img_pil).unsqueeze(0).to(self.device)
+        # (1, S=1, 3, 224, 224): a single-frame history for online rollout.
+        img_tensor = (
+            IMAGE_TRANSFORM(img_pil).unsqueeze(0).unsqueeze(0).to(self.device)
+        )
 
         prompt = f"Instruction: {instruction}\nAction:"
         enc = self.tokenizer(
@@ -174,6 +179,7 @@ class AirSimOnlineEvaluator:
         return (
             enc["input_ids"].to(self.device),
             enc["attention_mask"].to(self.device),
+            img_tensor,
         )
 
     def _run_episode(self, client, airsim, goal, task: str):
@@ -181,8 +187,10 @@ class AirSimOnlineEvaluator:
         instruction = self._task_instruction(task, goal)
 
         for step in range(max_steps):
-            input_ids, attn_mask = self._get_obs_tokens(client, instruction)
-            out = self.model(input_ids=input_ids, attention_mask=attn_mask)
+            input_ids, attn_mask, images = self._get_obs_tokens(client, instruction)
+            out = self.model(
+                input_ids=input_ids, attention_mask=attn_mask, images=images
+            )
             action = out["actions"][0, 0].cpu().numpy()   # take first predicted step
 
             # Send velocity command: [vx, vy, vz, yaw_rate]

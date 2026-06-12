@@ -4,6 +4,7 @@ model:
   load_in_4bit: true               # QLoRA: 4-bit base to fit on 12GB VRAM
 
   # ViT encoder
+  use_vision: true                 # Fuse ViT frame embeddings into context (VLA); false = text-only
   vit_model: "google/vit-base-patch16-224"
   vit_freeze: true                 # Freeze entire ViT
 
