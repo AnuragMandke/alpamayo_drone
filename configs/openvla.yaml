@@ -1,0 +1,30 @@
+# OpenVLA transfer pipeline config (runs in the OpenVLA env on the lab GPU).
+# See requirements-openvla.txt. This is separate from configs/default.yaml,
+# which drives the Qwen + FlowMatchingDecoder pipeline.
+
+model:
+  load_in_4bit: true          # 4-bit QLoRA for the pretrained arm (fits ~16GB)
+  lora:
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+
+data:
+  dataset_root: "data/uzh_fpv"
+  train_split: 0.9
+  predict_offset: 0           # predict the action at the observed frame
+  num_workers: 4
+
+training:
+  output_dir: "outputs/openvla"
+  seed: 42
+  epochs: 5                   # OpenVLA finetunes converge fast; tune on lab GPU
+  batch_size: 8               # per-step; raise on a 24-40GB GPU
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  optimizer:
+    lr: 5.0e-4                # OpenVLA LoRA finetuning default
+    weight_decay: 0.0
+  bf16: true
+  save_every_n_epochs: 1
+  log_every_n_steps: 20
