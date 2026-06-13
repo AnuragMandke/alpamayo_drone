@@ -1,52 +1,143 @@
 # Alpamayo-Drone: Cross-Embodiment VLA Finetuning for UAV Navigation
 
-Finetunes the Alpamayo-R1 VLA architecture on UAV navigation tasks via LoRA,
-with a FlowMatchingDecoder as the domain-agnostic policy head.
+**Thesis:** a vision-language-action (VLA) model pretrained on *ground*-robot
+tasks can transfer to *aerial* navigation through lightweight finetuning alone —
+without redesigning the architecture.
 
-## Project Structure
+The project is named for NVIDIA's **Alpamayo-R1** driving VLA (the inspiration
+for the cross-embodiment idea; its weights were released publicly in Dec 2025 as
+`nvidia/Alpamayo-R1-10B`). The transfer experiments here use **OpenVLA-7B**, an
+open ground-robot VLA, as the pretrained base on UZH-FPV drone-racing data.
+
+The drone action space is 4-DoF velocity control: `[vx, vy, vz, yaw_rate]`.
+
+---
+
+## Two pipelines
+
+The repo contains two finetuning approaches that share the same UZH-FPV dataset:
+
+| | **OpenVLA transfer** (primary) | **Qwen + FlowMatchingDecoder** |
+|---|---|---|
+| Backbone | OpenVLA-7B (robot-pretrained VLA) | Qwen2.5-3B-Instruct (LLM) + frozen ViT |
+| Action head | OpenVLA's **native** action tokens (reused prior) | FlowMatchingDecoder trained from scratch |
+| What transfers | vision-language **and** action prior | vision-language representation only |
+| Loss | cross-entropy on action tokens | conditional flow matching |
+| Config | `configs/openvla.yaml` | `configs/default.yaml` |
+| Entry | `scripts/train_openvla.py` | `scripts/train.py` |
+| Env | `requirements-openvla.txt` (transformers 4.40) | `requirements.txt` (transformers 5.x) |
+| Tests the claim | **directly** (reuses the robot action prior) | partially (representation transfer) |
+
+The OpenVLA pipeline is the proper test of the cross-embodiment claim; the
+Qwen + FlowMatchingDecoder pipeline is kept as an alternative-head comparison.
+See [docs/OPENVLA.md](docs/OPENVLA.md) for the OpenVLA pipeline in detail.
+
+---
+
+## Project structure
 
 ```
 alpamayo_drone/
 ├── configs/
-│   └── default.yaml          # All hyperparameters in one place
+│   ├── default.yaml          # Qwen + FlowMatchingDecoder pipeline
+│   ├── openvla.yaml          # OpenVLA transfer pipeline
+│   └── smoke_test.yaml       # tiny local backbone, fast end-to-end check
 ├── data/
-│   ├── airsim_dataset.py     # AirSim trajectory dataset
-│   └── transforms.py         # Observation preprocessing
+│   ├── airsim_dataset.py     # sliding-window dataset (8-frame history, action horizon)
+│   └── openvla_dataset.py    # OpenVLA single-frame, action-token dataset
 ├── models/
-│   ├── vit_encoder.py        # Visual encoder (ViT-B/16)
-│   ├── backbone.py           # Qwen2.5-style LLM backbone with GQA + RoPE
-│   ├── flow_matching.py      # FlowMatchingDecoder (action head)
-│   ├── alpamayo.py           # Full model assembly
-│   └── lora.py               # LoRA injection utilities
+│   ├── alpamayo.py           # Qwen+ViT+FlowMatchingDecoder assembly
+│   ├── flow_matching.py      # FlowMatchingDecoder (CFM action head)
+│   ├── lora.py               # hand-rolled LoRA (works with bitsandbytes 4-bit)
+│   ├── action_tokenizer.py   # OpenVLA action discretization + 4↔7-DoF mapping
+│   └── openvla_policy.py     # OpenVLA load + LoRA (transfer/scratch arms)
 ├── training/
-│   ├── trainer.py            # Training loop
-│   ├── losses.py             # Flow matching loss
-│   └── scheduler.py          # LR scheduler
+│   └── trainer.py            # training loop for the Qwen+FlowMatching pipeline
 ├── eval/
-│   ├── evaluator.py          # Task success rate + metrics
-│   └── airsim_env.py         # AirSim environment wrapper
+│   └── evaluator.py          # offline (L2/ADE/FDE) + online AirSim evaluators
 ├── scripts/
-│   ├── train.py              # Entry point: training
-│   ├── eval.py               # Entry point: evaluation
-│   └── download_data.py      # AirSim dataset download helper
-└── requirements.txt
+│   ├── train.py              # train: Qwen + FlowMatchingDecoder
+│   ├── train_openvla.py      # train: OpenVLA transfer (lab GPU, OpenVLA env)
+│   ├── eval.py               # evaluate the Qwen+FlowMatching pipeline
+│   ├── ablate.py             # LoRA-rank and decoder-type ablations
+│   ├── integration_test.py   # one-batch forward/backward gate
+│   ├── download_uzh_fpv.py   # download UZH-FPV (hardened, resumable)
+│   ├── convert_uzh_fpv.py    # UZH-FPV → trajectory format (both raw layouts)
+│   └── download_data.py      # synthetic AirSim trajectories (smoke tests only)
+├── tests/                    # CPU unit tests (action tokenizer, OpenVLA dataset)
+├── docs/OPENVLA.md           # OpenVLA pipeline: env, run, ablation design
+├── requirements.txt          # main env
+└── requirements-openvla.txt  # isolated OpenVLA env (transformers 4.40)
 ```
 
-## Setup
+---
+
+## Data
+
+Real data is **UZH-FPV** drone-racing sequences (snapdragon, with ground truth),
+converted to per-trajectory `images/ + actions.npy + instructions.txt`. Body-frame
+velocity actions are derived from the ground-truth poses.
+
+```bash
+python scripts/download_uzh_fpv.py --out data/raw/uzh_fpv          # ~12 GB, resumable
+python scripts/convert_uzh_fpv.py  --src data/raw/uzh_fpv --dst data/uzh_fpv --chunk_size 120
+# -> data/uzh_fpv/: 118 trajectories, ~14k frames (11.4k train / 1.3k val samples)
+```
+
+For a no-download smoke test, `scripts/download_data.py` generates synthetic
+trajectories under `data/airsim/`. Datasets are git-ignored (regenerable).
+
+---
+
+## Pipeline A — OpenVLA transfer (primary)
+
+Runs in an **isolated environment** on a **≥16 GB GPU** (OpenVLA's remote code
+requires transformers 4.40, incompatible with the main env's 5.x).
+
+```bash
+python -m venv .venv-openvla && .venv-openvla/Scripts/activate   # Windows
+pip install -r requirements-openvla.txt
+
+# Headline cross-embodiment ablation:
+python scripts/train_openvla.py --config configs/openvla.yaml --init pretrained  # transfer arm
+python scripts/train_openvla.py --config configs/openvla.yaml --init scratch     # control arm
+```
+
+The claim is supported if **pretrained + LoRA** beats **from-scratch** on drone
+action accuracy at a fraction of the trainable parameters. Full design (incl. the
+stronger Prismatic-base control) is in [docs/OPENVLA.md](docs/OPENVLA.md).
+
+---
+
+## Pipeline B — Qwen + FlowMatchingDecoder
+
+Runs in the main env; fits a 6 GB GPU (4-bit QLoRA).
 
 ```bash
 pip install -r requirements.txt
-python scripts/download_data.py          # downloads AirSim trajectories
+
+# Fast end-to-end sanity check (tiny local backbone, no large download):
+python scripts/integration_test.py --config configs/smoke_test.yaml
+python scripts/train.py --config configs/smoke_test.yaml
+
+# Real run:
 python scripts/train.py --config configs/default.yaml
-python scripts/eval.py  --config configs/default.yaml --ckpt outputs/best.pt
+python scripts/eval.py  --config configs/default.yaml --ckpt outputs/<run>/<ckpt> --mode offline
 ```
 
-## Key Design Decisions
+**Design:** frozen ViT-B/16 encodes each frame → projected and prepended to the
+Qwen hidden states as cross-attention memory for a FlowMatchingDecoder that emits
+4 future actions. Only LoRA (rank 16) + the vision projection + the decoder train
+(~0.4% of params); the backbone is 4-bit quantized and otherwise frozen. Actions
+are normalized per-dim; the decoder cross-attention masks text padding.
 
-- **Base model:** Qwen2.5-3B-Instruct as Alpamayo-R1 proxy (Alpamayo-R1 weights
-  are not public; vision is provided by a separate frozen ViT, so a text-only
-  backbone suffices)
-- **Finetuning:** LoRA injected into backbone attention (rank 16, α 32)
-- **Action head:** FlowMatchingDecoder — 8-step DDIM, action dim = 4 (vx, vy, vz, yaw_rate)
-- **Frozen:** ViT encoder + first 12 backbone layers; only LoRA + vision projection + decoder trained
-- **Hardware target:** 6GB VRAM (RTX 4050 laptop) with 4-bit quantized base + bf16 autocast
+---
+
+## Status
+
+- **Pipeline B** is end-to-end verified on the dev laptop (smoke train + offline
+  eval pass; full UZH-FPV run is a standard GPU job).
+- **Pipeline A** data layer is CPU-verified (`python tests/test_action_tokenizer.py`,
+  `python tests/test_openvla_dataset.py`). The model load + training step are
+  written against OpenVLA's verified API but run on the lab GPU in the OpenVLA
+  env — they cannot be exercised on a 6 GB laptop.
