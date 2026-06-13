@@ -81,9 +81,11 @@ def run_single(cfg: dict, run_name: str, device: torch.device) -> dict:
     print(f"{'='*55}")
 
     model = AlpamayoDrone(cfg)
-    model.to(device)
+    model.prepare_device(device)
 
     train_loader, val_loader = build_dataloaders(cfg, model.tokenizer)
+    stats = train_loader.dataset.compute_action_stats()
+    model.set_action_stats(stats["mean"], stats["std"])
 
     # Override output dir per run
     cfg_run = copy.deepcopy(cfg)
@@ -137,10 +139,12 @@ def ablation_decoder_type(cfg: dict, device: torch.device) -> list[dict]:
         context_dim=context_dim,
         action_dim=cfg["model"]["flow_matching"]["action_dim"],
         action_horizon=cfg["data"]["action_horizon"],
-    ).to(device)
-    model.to(device)
+    )
+    model.prepare_device(device)
 
     train_loader, val_loader = build_dataloaders(c, model.tokenizer)
+    stats = train_loader.dataset.compute_action_stats()
+    model.set_action_stats(stats["mean"], stats["std"])
     trainer = Trainer(model, train_loader, val_loader, c, device)
     trainer.train()
 

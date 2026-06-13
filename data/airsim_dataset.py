@@ -107,6 +107,25 @@ class AirSimDroneDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def compute_action_stats(self) -> dict:
+        """
+        Per-dimension mean/std over all actions of this split's trajectories.
+
+        Used to normalize actions for flow matching (the decoder integrates
+        from N(0, I), so targets should be roughly unit-scale).
+        """
+        trajs = sorted({traj for traj, _ in self.samples})
+        all_actions = np.concatenate(
+            [np.load(t / "actions.npy") for t in trajs], axis=0
+        )  # (sum_T, action_dim)
+        mean = all_actions.mean(axis=0)
+        # Floor the std so near-constant dims don't blow up the normalization
+        std = np.maximum(all_actions.std(axis=0), 1e-3)
+        return {
+            "mean": torch.tensor(mean, dtype=torch.float32),
+            "std":  torch.tensor(std, dtype=torch.float32),
+        }
+
     def __getitem__(self, idx: int) -> dict:
         traj_path, t = self.samples[idx]
 
@@ -132,11 +151,13 @@ class AirSimDroneDataset(Dataset):
         # For non-VLA tokenizers, we include a placeholder.
         prompt = f"Instruction: {instruction}\nAction:"
 
+        # No fixed-length padding here: batches are padded to the longest
+        # prompt in the batch by make_collate_fn (saves memory and avoids
+        # attending over hundreds of pad tokens).
         encoding = self.tokenizer(
             prompt,
             return_tensors="pt",
             max_length=self.max_seq_tokens,
-            padding="max_length",
             truncation=True,
         )
 
@@ -156,6 +177,31 @@ class AirSimDroneDataset(Dataset):
             "images":         images,                                  # (seq_len, 3, 224, 224)
             "traj_id":        traj_path.name,
         }
+
+
+def make_collate_fn(tokenizer):
+    """Pad variable-length prompts to the longest in the batch (right-padded)."""
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+
+    def collate(batch):
+        max_len = max(b["input_ids"].shape[0] for b in batch)
+        input_ids = torch.full((len(batch), max_len), pad_id, dtype=torch.long)
+        attention_mask = torch.zeros((len(batch), max_len), dtype=torch.long)
+        for i, b in enumerate(batch):
+            L = b["input_ids"].shape[0]
+            input_ids[i, :L] = b["input_ids"]
+            attention_mask[i, :L] = b["attention_mask"]
+        return {
+            "input_ids":      input_ids,
+            "attention_mask": attention_mask,
+            "actions":        torch.stack([b["actions"] for b in batch]),
+            "images":         torch.stack([b["images"] for b in batch]),
+            "traj_id":        [b["traj_id"] for b in batch],
+        }
+
+    return collate
 
 
 def build_dataloaders(cfg: dict, tokenizer) -> tuple:
@@ -182,6 +228,7 @@ def build_dataloaders(cfg: dict, tokenizer) -> tuple:
         action_horizon=dc["action_horizon"],
     )
 
+    collate = make_collate_fn(tokenizer)
     train_loader = DataLoader(
         train_ds,
         batch_size=tc["batch_size"],
@@ -189,6 +236,7 @@ def build_dataloaders(cfg: dict, tokenizer) -> tuple:
         num_workers=dc["num_workers"],
         pin_memory=True,
         drop_last=True,
+        collate_fn=collate,
     )
     val_loader = DataLoader(
         val_ds,
@@ -196,5 +244,6 @@ def build_dataloaders(cfg: dict, tokenizer) -> tuple:
         shuffle=False,
         num_workers=dc["num_workers"],
         pin_memory=True,
+        collate_fn=collate,
     )
     return train_loader, val_loader

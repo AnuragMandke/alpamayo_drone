@@ -4,7 +4,7 @@ alpamayo.py — Full Alpamayo-Drone model
 Architecture:
     ViT encoder (frozen)  →  per-frame visual tokens ┐
                                                        ├→ fused context memory
-    OpenVLA backbone      →  text hidden states       ┘   (LoRA finetuned)
+    LLM backbone          →  text hidden states       ┘   (LoRA finetuned)
     FlowMatchingDecoder   →  UAV action sequence           (fully trained)
 
 The backbone's causal LM head is discarded; instead its last-layer hidden
@@ -39,7 +39,8 @@ class AlpamayoDrone(nn.Module):
         fm = mc["flow_matching"]
 
         # ------------------------------------------------------------------
-        # 1.  Load backbone (OpenVLA-7B as Alpamayo-R1 proxy)
+        # 1.  Load backbone (plain LLM as Alpamayo-R1 proxy; vision is
+        #     provided separately by the ViT pathway below)
         # ------------------------------------------------------------------
         print(f"[Model] Loading backbone: {mc['base_model_id']}")
 
@@ -52,15 +53,23 @@ class AlpamayoDrone(nn.Module):
                 bnb_4bit_compute_dtype=torch.bfloat16,
             )
 
+        # device_map only for the quantized path: a quantized model is
+        # dispatched by accelerate and must never be moved with .to() again.
+        load_kwargs = dict(
+            dtype=torch.bfloat16,
+            trust_remote_code=mc.get("trust_remote_code", False),
+        )
+        if bnb_config is not None:
+            load_kwargs["quantization_config"] = bnb_config
+            load_kwargs["device_map"] = "auto"
+        self.backbone_dispatched = bnb_config is not None
+
         self.backbone = AutoModel.from_pretrained(
-            mc["base_model_id"],
-            quantization_config=bnb_config,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True,
+            mc["base_model_id"], **load_kwargs
         )
         self.tokenizer = AutoTokenizer.from_pretrained(
-            mc["base_model_id"], trust_remote_code=True
+            mc["base_model_id"],
+            trust_remote_code=mc.get("trust_remote_code", False),
         )
 
         # Freeze bottom N layers
@@ -96,7 +105,7 @@ class AlpamayoDrone(nn.Module):
         if self.use_vision:
             print(f"[Model] Loading vision encoder: {mc['vit_model']}")
             self.vit = ViTModel.from_pretrained(
-                mc["vit_model"], torch_dtype=torch.bfloat16
+                mc["vit_model"], dtype=torch.bfloat16
             )
             if mc.get("vit_freeze", True):
                 for p in self.vit.parameters():
@@ -132,6 +141,22 @@ class AlpamayoDrone(nn.Module):
             sigma_min=fm["sigma_min"],
         )
 
+        # ------------------------------------------------------------------
+        # 4.  Action normalization stats (identity until set_action_stats).
+        #     The decoder integrates from N(0, I), so it is trained on
+        #     normalized actions; forward() normalizes targets and
+        #     denormalizes samples so callers only ever see physical units.
+        # ------------------------------------------------------------------
+        self.register_buffer("action_mean", torch.zeros(fm["action_dim"]))
+        self.register_buffer("action_std", torch.ones(fm["action_dim"]))
+
+    def set_action_stats(self, mean, std):
+        mean = torch.as_tensor(mean, dtype=torch.float32)
+        std = torch.as_tensor(std, dtype=torch.float32)
+        self.action_mean.copy_(mean.to(self.action_mean.device))
+        self.action_std.copy_(std.to(self.action_std.device))
+        print(f"[Model] Action stats set: mean={mean.tolist()} std={std.tolist()}")
+
     # ------------------------------------------------------------------
 
     def _freeze_backbone_layers(self, n: int):
@@ -157,6 +182,27 @@ class AlpamayoDrone(nn.Module):
                 for p in layer.parameters():
                     p.requires_grad_(False)
             print(f"[Model] Froze first {n} backbone layers")
+
+    # ------------------------------------------------------------------
+
+    def prepare_device(self, device: torch.device):
+        """
+        Move the model to `device`.
+
+        Use this instead of .to(device): a 4-bit backbone is dispatched by
+        accelerate at load time and raises if moved again, so only the
+        non-dispatched submodules are moved in that case.
+        """
+        if self.backbone_dispatched:
+            for name, module in self.named_children():
+                if name != "backbone":
+                    module.to(device)
+            # Top-level buffers (action stats) are not children — move them too
+            for name, buf in self.named_buffers(recurse=False):
+                setattr(self, name, buf.to(device))
+        else:
+            self.to(device)
+        return self
 
     # ------------------------------------------------------------------
 
@@ -212,10 +258,16 @@ class AlpamayoDrone(nn.Module):
         actions_gt: torch.Tensor = None,  # (B, action_horizon, action_dim) — training only
     ) -> dict:
         context = self.encode_observation(input_ids, attention_mask, images)
+        # The bf16 backbone context must match the decoder's param dtype when
+        # running without autocast (e.g. plain eval); under autocast this cast
+        # is a no-op for the subsequent matmuls.
+        context = context.to(next(self.decoder.parameters()).dtype)
 
         if actions_gt is not None:
-            loss = self.decoder.cfm_loss(actions_gt, context)
+            actions_norm = (actions_gt - self.action_mean) / self.action_std
+            loss = self.decoder.cfm_loss(actions_norm, context)
             return {"loss": loss, "actions": None}
         else:
             actions = self.decoder.sample(context, action_horizon=4)
+            actions = actions * self.action_std + self.action_mean
             return {"loss": None, "actions": actions}

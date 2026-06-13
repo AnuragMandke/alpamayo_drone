@@ -214,8 +214,14 @@ class Trainer:
         if getattr(self.model, "vis_proj", None) is not None:
             torch.save(self.model.vis_proj.state_dict(), ckpt_dir / "vision.pt")
 
-        # Save metadata
-        meta = {"epoch": epoch, "val_loss": val_loss, "global_step": self.global_step}
+        # Save metadata (incl. action normalization stats — eval needs them)
+        meta = {
+            "epoch": epoch,
+            "val_loss": val_loss,
+            "global_step": self.global_step,
+            "action_mean": self.model.action_mean.detach().cpu(),
+            "action_std": self.model.action_std.detach().cpu(),
+        }
         torch.save(meta, ckpt_dir / "meta.pt")
 
         print(f"  [Checkpoint] Saved -> {ckpt_dir}  (val_loss={val_loss:.4f})")

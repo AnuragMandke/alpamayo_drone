@@ -43,8 +43,10 @@ python scripts/eval.py  --config configs/default.yaml --ckpt outputs/best.pt
 
 ## Key Design Decisions
 
-- **Base model:** OpenVLA-7B (public weights) as Alpamayo-R1 base weights are not public
+- **Base model:** Qwen2.5-3B-Instruct as Alpamayo-R1 proxy (Alpamayo-R1 weights
+  are not public; vision is provided by a separate frozen ViT, so a text-only
+  backbone suffices)
 - **Finetuning:** LoRA injected into backbone attention (rank 16, α 32)
 - **Action head:** FlowMatchingDecoder — 8-step DDIM, action dim = 4 (vx, vy, vz, yaw_rate)
-- **Frozen:** ViT encoder + first 12 backbone layers; only LoRA + decoder trained
-- **Hardware target:** RTX 3060 12GB with 4-bit quantized base + bf16 LoRA
+- **Frozen:** ViT encoder + first 12 backbone layers; only LoRA + vision projection + decoder trained
+- **Hardware target:** 6GB VRAM (RTX 4050 laptop) with 4-bit quantized base + bf16 autocast

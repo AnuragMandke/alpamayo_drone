@@ -54,7 +54,7 @@ def main():
     from models.lora import load_lora_weights
 
     model = AlpamayoDrone(cfg)
-    model.to(device)
+    model.prepare_device(device)
     model.eval()
 
     ckpt_dir = Path(args.ckpt)
@@ -69,6 +69,15 @@ def main():
             torch.load(vision_ckpt, map_location=device)
         )
         print("[Eval] Restored vision projection")
+
+    meta_path = ckpt_dir / "meta.pt"
+    if meta_path.exists():
+        meta = torch.load(meta_path, map_location="cpu")
+        if "action_mean" in meta:
+            model.set_action_stats(meta["action_mean"], meta["action_std"])
+        else:
+            print("[Eval] WARNING: checkpoint has no action stats; "
+                  "predictions will be in normalized units")
 
     # ------------------------------------------------------------------
     # Offline eval

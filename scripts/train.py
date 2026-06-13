@@ -76,7 +76,7 @@ def main():
     from models.lora import load_lora_weights
 
     model = AlpamayoDrone(cfg)
-    model.to(device)
+    model.prepare_device(device)
 
     # Resume from checkpoint if requested
     if args.resume:
@@ -98,6 +98,19 @@ def main():
     # ------------------------------------------------------------------
     from data.airsim_dataset import build_dataloaders
     train_loader, val_loader = build_dataloaders(cfg, model.tokenizer)
+
+    # Action normalization: prefer the stats the checkpoint was trained with;
+    # otherwise compute them from the train split.
+    resume_meta = Path(args.resume) / "meta.pt" if args.resume else None
+    if resume_meta and resume_meta.exists():
+        meta = torch.load(resume_meta, map_location="cpu")
+    else:
+        meta = {}
+    if "action_mean" in meta:
+        model.set_action_stats(meta["action_mean"], meta["action_std"])
+    else:
+        stats = train_loader.dataset.compute_action_stats()
+        model.set_action_stats(stats["mean"], stats["std"])
 
     # ------------------------------------------------------------------
     # Train

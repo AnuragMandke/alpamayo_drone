@@ -13,9 +13,12 @@ import torch.nn as nn
 
 class LoRALinear(nn.Module):
     """
-    Replaces a Linear layer with W + B @ A (LoRA).
+    Wraps a Linear-like layer with W + B @ A (LoRA).
 
-    Only A and B are trained; the original weight is frozen.
+    The base layer is kept intact and invoked through its own forward().
+    This is required for quantized layers (e.g. bitsandbytes Linear4bit,
+    whose packed weight cannot go through F.linear) and keeps any custom
+    forward logic of the wrapped module. Only A and B are trained.
     """
 
     def __init__(
@@ -30,9 +33,8 @@ class LoRALinear(nn.Module):
         self.alpha = alpha
         self.scaling = alpha / rank
 
-        # Frozen base weight
-        self.weight = original.weight
-        self.bias = original.bias
+        # Frozen base layer (may be nn.Linear or a quantized subclass)
+        self.base = original
         self.in_features = original.in_features
         self.out_features = original.out_features
 
@@ -49,9 +51,15 @@ class LoRALinear(nn.Module):
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base = nn.functional.linear(x, self.weight, self.bias)
-        lora = (self.dropout(x) @ self.lora_A.T @ self.lora_B.T) * self.scaling
-        return base + lora
+        base = self.base(x)
+        # LoRA params live in fp32; cast to the activation dtype so this
+        # works both under autocast(bf16) and in plain eval.
+        lora = (
+            self.dropout(x)
+            @ self.lora_A.T.to(x.dtype)
+            @ self.lora_B.T.to(x.dtype)
+        ) * self.scaling
+        return base + lora.to(base.dtype)
 
     def extra_repr(self) -> str:
         return (
@@ -86,6 +94,11 @@ def inject_lora(
             continue
 
         lora_layer = LoRALinear(module, rank=rank, alpha=alpha, dropout=dropout)
+
+        # Adapters must live where the (possibly dispatched) base weight lives
+        device = module.weight.device
+        lora_layer.lora_A.data = lora_layer.lora_A.data.to(device)
+        lora_layer.lora_B.data = lora_layer.lora_B.data.to(device)
 
         # Navigate to parent and swap the child
         parts = name.split(".")

@@ -160,12 +160,65 @@ def derive_actions(timestamps, positions, quats):
 # Image discovery and timestamp alignment
 # ------------------------------------------------------------------
 
-def discover_images(img_dir: Path):
+def discover_images(seq_dir: Path):
+    """
+    Find frames and their timestamps, supporting two UZH-FPV layouts:
+
+      1. Index-file layout (raw download): seq_dir/left_images.txt with
+         '# id timestamp image_name' rows pointing at img/image_0_*.png
+         (camera 0 = left). Timestamps come straight from the index.
+
+      2. Timestamp-in-filename layout (preprocessed): img/frame_<ts>.png
+
+    Returns (image_paths sorted by timestamp, timestamps (N,) float64 in the
+    raw source unit — rescaled later against the groundtruth clock).
+    """
+    index_file = seq_dir / "left_images.txt"
+    if index_file.is_file():
+        return _discover_from_index(seq_dir, index_file)
+    return _discover_from_frame_names(seq_dir / "img")
+
+
+def _discover_from_index(seq_dir: Path, index_file: Path):
+    """Parse a UZH-FPV '<id> <timestamp> <image_name>' index file (left cam)."""
+    paths, stamps = [], []
+    try:
+        with open(index_file) as f:
+            for line_no, line in enumerate(f, 1):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) < 3:
+                    print(f"  [Warn] {index_file.name}:{line_no}: expected "
+                          f">=3 columns, got {len(parts)} — skipping line")
+                    continue
+                img_path = seq_dir / parts[2]   # parts[2] is e.g. img/image_0_0.png
+                if not img_path.is_file():
+                    continue
+                paths.append(img_path)
+                stamps.append(float(parts[1]))
+    except OSError as e:
+        raise RuntimeError(f"Failed to read image index {index_file}: {e}") from e
+    except ValueError as e:
+        raise RuntimeError(f"Malformed timestamp in {index_file}: {e}") from e
+
+    if not paths:
+        raise RuntimeError(
+            f"No images listed in {index_file} exist on disk under {seq_dir}"
+        )
+
+    order = np.argsort(stamps)
+    paths = [paths[i] for i in order]
+    stamps = np.asarray(stamps, dtype=np.float64)[order]
+    return paths, stamps
+
+
+def _discover_from_frame_names(img_dir: Path):
     """
     Find frame_*.png images and parse timestamps from filenames.
 
-    Returns (image_paths sorted by timestamp, timestamps (N,) float64 in the
-    raw filename unit — rescaled later against the groundtruth clock).
+    Returns (image_paths sorted by timestamp, timestamps (N,) float64).
     """
     try:
         files = sorted(img_dir.glob("frame_*.png"))
@@ -248,7 +301,7 @@ def convert_sequence(seq_dir: Path, dst_root: Path, chunk_size: int,
     gt_ts, positions, quats = parse_groundtruth(seq_dir / "groundtruth.txt")
     actions_full = derive_actions(gt_ts, positions, quats)   # (T-1, 4)
 
-    img_paths, img_ts_raw = discover_images(seq_dir / "img")
+    img_paths, img_ts_raw = discover_images(seq_dir)
     img_ts = rescale_image_timestamps(img_ts_raw, gt_ts)
     gt_idx, align_dist = align_images_to_gt(img_ts, gt_ts)
 

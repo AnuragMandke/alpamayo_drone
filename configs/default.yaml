@@ -1,7 +1,10 @@
 model:
-  # Base model — OpenVLA-7B (public) used as Alpamayo-R1 proxy
-  base_model_id: "openvla/openvla-7b"
-  load_in_4bit: true               # QLoRA: 4-bit base to fit on 12GB VRAM
+  # Base model — plain LLM used as Alpamayo-R1 proxy (vision comes from the
+  # separate ViT pathway, so a text-only backbone is sufficient).
+  # 3B fits a 6GB GPU in 4-bit with headroom; on >=12GB VRAM consider
+  # "Qwen/Qwen2.5-7B-Instruct".
+  base_model_id: "Qwen/Qwen2.5-3B-Instruct"
+  load_in_4bit: true               # QLoRA: 4-bit base
 
   # ViT encoder
   use_vision: true                 # Fuse ViT frame embeddings into context (VLA); false = text-only
@@ -33,7 +36,9 @@ model:
     sigma_min: 0.001
 
 data:
-  dataset_root: "data/airsim"
+  dataset_root: "data/uzh_fpv"    # real UZH-FPV data (scripts/download_uzh_fpv.py
+                                  # + scripts/convert_uzh_fpv.py); the synthetic
+                                  # data/airsim set is only for smoke tests
   sequence_length: 8              # Frames per training sample
   image_size: 224
   action_horizon: 4               # Predict 4 future actions
@@ -46,8 +51,8 @@ training:
   seed: 42
 
   epochs: 30
-  batch_size: 8                   # Per-GPU; effective 8 on single 3060
-  gradient_accumulation_steps: 4  # Effective batch = 32
+  batch_size: 2                   # Sized for 6GB VRAM (RTX 4050 laptop)
+  gradient_accumulation_steps: 16 # Effective batch = 32
   max_grad_norm: 1.0
 
   optimizer:

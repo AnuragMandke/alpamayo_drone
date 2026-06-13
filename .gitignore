@@ -7,8 +7,7 @@ __pycache__/
 # Generated datasets and fixtures (regenerable via scripts/)
 data/airsim/
 data/raw/
-data/airsim_uzh_test/
-data/airsim_uzh_single/
+data/uzh_fpv/
 data/tiny_backbone/
 
 # Training outputs
