@@ -52,16 +52,22 @@ class MLPActionHead(nn.Module):
         )
         self.action_dim = action_dim
 
-    def cfm_loss(self, action_gt, context):
-        # Use mean pooled context
-        ctx_pooled = context.mean(dim=1)   # (B, context_dim)
+    def _pool(self, context, memory_key_padding_mask):
+        """Masked mean over the context (ignore padding columns)."""
+        if memory_key_padding_mask is None:
+            return context.mean(dim=1)
+        valid = (~memory_key_padding_mask).unsqueeze(-1).to(context.dtype)
+        return (context * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
+
+    def cfm_loss(self, action_gt, context, memory_key_padding_mask=None):
+        ctx_pooled = self._pool(context, memory_key_padding_mask)   # (B, context_dim)
         pred = self.net(ctx_pooled).view(
             action_gt.shape[0], self.action_horizon, self.action_dim
         )
         return nn.functional.mse_loss(pred, action_gt)
 
-    def sample(self, context, action_horizon=4):
-        ctx_pooled = context.mean(dim=1)
+    def sample(self, context, action_horizon=4, memory_key_padding_mask=None):
+        ctx_pooled = self._pool(context, memory_key_padding_mask)
         return self.net(ctx_pooled).view(
             context.shape[0], self.action_horizon, self.action_dim
         )

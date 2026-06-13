@@ -72,6 +72,11 @@ class FlowMatchingDecoder(nn.Module):
         self.num_train_steps = num_train_steps
         self.sigma_min = sigma_min
 
+        # Normalize raw context before projecting. LLM last-layer hidden
+        # states carry a few large-magnitude outlier dimensions that
+        # otherwise dominate context_proj and inflate the CFM loss at init.
+        self.context_norm = nn.LayerNorm(context_dim)
+
         # Project context embedding into hidden_dim
         self.context_proj = nn.Linear(context_dim, hidden_dim)
 
@@ -113,15 +118,19 @@ class FlowMatchingDecoder(nn.Module):
         noisy_action: torch.Tensor,   # (B, action_horizon, action_dim)
         context: torch.Tensor,        # (B, seq_len, context_dim)
         t: torch.Tensor,              # (B,) timestep in [0, 1]
+        memory_key_padding_mask: torch.Tensor = None,  # (B, seq_len) True = ignore
     ) -> torch.Tensor:
         """
         Predict the velocity field v(x_t, t, c) for flow matching.
         Returns tensor of shape (B, action_horizon, action_dim).
+
+        memory_key_padding_mask marks context positions to ignore in
+        cross-attention (e.g. text padding tokens); True = masked out.
         """
         B, H, _ = noisy_action.shape
 
-        # Project context: (B, seq_len, hidden_dim)
-        ctx = self.context_proj(context)
+        # Normalize then project context: (B, seq_len, hidden_dim)
+        ctx = self.context_proj(self.context_norm(context))
 
         # Project noisy action: (B, H, hidden_dim)
         act = self.action_proj(noisy_action)
@@ -131,7 +140,10 @@ class FlowMatchingDecoder(nn.Module):
         act = act + t_emb
 
         # Transformer decode
-        out = self.transformer(tgt=act, memory=ctx)   # (B, H, hidden_dim)
+        out = self.transformer(
+            tgt=act, memory=ctx,
+            memory_key_padding_mask=memory_key_padding_mask,
+        )                                             # (B, H, hidden_dim)
 
         # Project to velocity field
         velocity = self.out_proj(out)                 # (B, H, action_dim)
@@ -145,6 +157,7 @@ class FlowMatchingDecoder(nn.Module):
         self,
         action_gt: torch.Tensor,   # (B, H, action_dim)  ground-truth
         context: torch.Tensor,     # (B, seq_len, context_dim)
+        memory_key_padding_mask: torch.Tensor = None,  # (B, seq_len) True = ignore
     ) -> torch.Tensor:
         """
         CFM training loss.
@@ -170,7 +183,7 @@ class FlowMatchingDecoder(nn.Module):
         target_v = action_gt - noise
 
         # Predicted velocity
-        pred_v = self.forward(x_t, context, t)
+        pred_v = self.forward(x_t, context, t, memory_key_padding_mask)
 
         return F.mse_loss(pred_v, target_v)
 
@@ -183,6 +196,7 @@ class FlowMatchingDecoder(nn.Module):
         self,
         context: torch.Tensor,        # (B, seq_len, context_dim)
         action_horizon: int = 4,
+        memory_key_padding_mask: torch.Tensor = None,  # (B, seq_len) True = ignore
     ) -> torch.Tensor:
         """
         Generate actions by integrating the learned velocity field
@@ -201,7 +215,7 @@ class FlowMatchingDecoder(nn.Module):
         for i in range(self.num_diffusion_steps):
             t_val = i / self.num_diffusion_steps
             t = torch.full((B,), t_val, device=device)
-            v = self.forward(x, context, t)
+            v = self.forward(x, context, t, memory_key_padding_mask)
             x = x + dt * v
 
         return x

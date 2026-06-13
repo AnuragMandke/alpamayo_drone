@@ -141,6 +141,9 @@ class AlpamayoDrone(nn.Module):
             sigma_min=fm["sigma_min"],
         )
 
+        # Number of future actions to predict (kept in sync with the dataset)
+        self.action_horizon = cfg["data"]["action_horizon"]
+
         # ------------------------------------------------------------------
         # 4.  Action normalization stats (identity until set_action_stats).
         #     The decoder integrates from N(0, I), so it is trained on
@@ -226,14 +229,17 @@ class AlpamayoDrone(nn.Module):
         input_ids: torch.Tensor,        # (B, seq_len)  tokenized obs + instruction
         attention_mask: torch.Tensor,   # (B, seq_len)
         images: torch.Tensor = None,    # (B, S, 3, H, W)  frame history
-    ) -> torch.Tensor:
+    ) -> tuple:
         """
         Run the backbone, then (if vision is enabled and images are provided)
         prepend the projected per-frame ViT embeddings to the text hidden
         states. The concatenation along the sequence axis becomes the decoder's
         cross-attention memory.
 
-        Returns (B, S + seq_len, hidden_dim) with vision, else (B, seq_len, hidden_dim).
+        Returns (context, memory_key_padding_mask):
+            context: (B, S + seq_len, hidden_dim) with vision, else (B, seq_len, hidden_dim)
+            mask:    (B, mem_len) bool, True = ignore (text padding positions;
+                     prepended vision tokens are always attended).
         """
         outputs = self.backbone(
             input_ids=input_ids,
@@ -242,11 +248,20 @@ class AlpamayoDrone(nn.Module):
         )
         text_ctx = outputs.last_hidden_state   # (B, seq_len, hidden_dim)
 
+        # Text padding positions (attention_mask == 0) are masked out.
+        text_pad = attention_mask == 0         # (B, seq_len) True = pad
+
         if self.use_vision and images is not None:
             vis = self._encode_frames(images, out_dtype=text_ctx.dtype)
-            return torch.cat([vis, text_ctx], dim=1)
+            context = torch.cat([vis, text_ctx], dim=1)
+            # Vision tokens are always valid → False for those columns.
+            vis_pad = torch.zeros(
+                vis.shape[:2], dtype=torch.bool, device=text_pad.device
+            )
+            mask = torch.cat([vis_pad, text_pad], dim=1)
+            return context, mask
 
-        return text_ctx
+        return text_ctx, text_pad
 
     # ------------------------------------------------------------------
 
@@ -257,7 +272,7 @@ class AlpamayoDrone(nn.Module):
         images: torch.Tensor = None,      # (B, S, 3, H, W)  frame history
         actions_gt: torch.Tensor = None,  # (B, action_horizon, action_dim) — training only
     ) -> dict:
-        context = self.encode_observation(input_ids, attention_mask, images)
+        context, mem_mask = self.encode_observation(input_ids, attention_mask, images)
         # The bf16 backbone context must match the decoder's param dtype when
         # running without autocast (e.g. plain eval); under autocast this cast
         # is a no-op for the subsequent matmuls.
@@ -265,9 +280,12 @@ class AlpamayoDrone(nn.Module):
 
         if actions_gt is not None:
             actions_norm = (actions_gt - self.action_mean) / self.action_std
-            loss = self.decoder.cfm_loss(actions_norm, context)
+            loss = self.decoder.cfm_loss(actions_norm, context, mem_mask)
             return {"loss": loss, "actions": None}
         else:
-            actions = self.decoder.sample(context, action_horizon=4)
+            actions = self.decoder.sample(
+                context, action_horizon=self.action_horizon,
+                memory_key_padding_mask=mem_mask,
+            )
             actions = actions * self.action_std + self.action_mean
             return {"loss": None, "actions": actions}
