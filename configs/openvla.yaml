@@ -19,7 +19,10 @@ training:
   output_dir: "outputs/openvla"
   seed: 42
   epochs: 5                   # OpenVLA finetunes converge fast; tune on lab GPU
-  batch_size: 8               # per-step; raise on a 24-40GB GPU
+  batch_size: 8               # per-step; raise on a 24-40GB GPU. NOTE: the
+                              # scratch arm keeps a bf16 (~14GB) base vs the
+                              # pretrained arm's 4-bit base, so it needs >=24GB
+                              # or a smaller batch_size than the pretrained run.
   gradient_accumulation_steps: 2
   max_grad_norm: 1.0
   optimizer:

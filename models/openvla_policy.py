@@ -60,6 +60,12 @@ def build_openvla_policy(
         model = AutoModelForVision2Seq.from_pretrained(
             OPENVLA_ID,
             quantization_config=bnb,
+            # A 4-bit model must be dispatched to the GPU at load time; without a
+            # device_map the weights stay on CPU, bnb's Linear4bit can't be moved
+            # with .to(), and the train loop's batch.to("cuda") then mismatches.
+            # Pin to a single GPU ({"": 0}) rather than "auto" so a 7B model is
+            # never split across CPU/GPU (which breaks the LoRA/checkpoint path).
+            device_map={"": 0} if bnb is not None else None,
             torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
             trust_remote_code=True,
@@ -68,14 +74,18 @@ def build_openvla_policy(
         print(f"[OpenVLA] pretrained + LoRA(r={lora_rank}) — transfer arm")
 
     elif init == "scratch":
-        # Same architecture, random weights, NOT quantized (random 4-bit base
-        # cannot be LoRA-finetuned meaningfully). Fully trainable control arm.
+        # Same architecture and SAME LoRA setup as the transfer arm, but weights
+        # are RANDOMLY initialized instead of robot-pretrained — so the arms
+        # differ only in initialization, which is the clean ablation. We freeze
+        # the random base and train only LoRA: full fine-tuning a 7B from scratch
+        # needs ~70GB of AdamW state (OOMs the lab GPU) and can't converge on
+        # ~12k samples anyway. This is the self-contained "no-pretraining" lower
+        # bound; the Prismatic VLM base is the stronger gold-standard control.
         config = AutoConfig.from_pretrained(OPENVLA_ID, trust_remote_code=True)
         model = AutoModelForVision2Seq.from_config(config, trust_remote_code=True)
         model = model.to(torch.bfloat16)
-        for p in model.parameters():
-            p.requires_grad_(True)
-        print("[OpenVLA] random init, full fine-tune — from-scratch control arm")
+        model = _apply_lora(model, lora_rank, lora_alpha, lora_dropout, quantized=False)
+        print(f"[OpenVLA] random init + LoRA(r={lora_rank}) — from-scratch control arm")
 
     else:
         raise ValueError(f"init must be 'pretrained' or 'scratch', got {init!r}")
@@ -90,6 +100,15 @@ def _apply_lora(model, rank, alpha, dropout, quantized):
         model = prepare_model_for_kbit_training(
             model, use_gradient_checkpointing=True
         )
+    else:
+        # Non-quantized base (scratch control): get_peft_model freezes the base
+        # and trains only LoRA, but we still checkpoint to keep the frozen 14GB
+        # bf16 backbone's activations off the GPU. enable_input_require_grads is
+        # required so gradients flow to the LoRA adapters through a frozen base.
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
     lora_cfg = LoraConfig(
         r=rank,
         lora_alpha=alpha,
