@@ -100,12 +100,15 @@ pip install -r requirements-openvla.txt
 
 # Headline cross-embodiment ablation:
 python scripts/train_openvla.py --config configs/openvla.yaml --init pretrained  # transfer arm
-python scripts/train_openvla.py --config configs/openvla.yaml --init scratch     # control arm
+python scripts/train_openvla.py --config configs/openvla.yaml --init scratch     # weak control
+python scripts/train_openvla.py --config configs/openvla.yaml --init prismatic   # clean control
 ```
 
-The claim is supported if **pretrained + LoRA** beats **from-scratch** on drone
-action accuracy at a fraction of the trainable parameters. Full design (incl. the
-stronger Prismatic-base control) is in [docs/OPENVLA.md](docs/OPENVLA.md).
+The claim is supported if **pretrained + LoRA** beats from-scratch on drone
+action accuracy at a fraction of the trainable parameters. The `prismatic` arm
+(VL-pretrained but robot-naive, same architecture + LoRA) is the control that
+isolates *robot* pretraining and is the only one that can falsify the claim —
+full design in [docs/OPENVLA.md](docs/OPENVLA.md).
 
 ---
 
@@ -137,7 +140,10 @@ are normalized per-dim; the decoder cross-attention masks text padding.
 
 - **Pipeline B** is end-to-end verified on the dev laptop (smoke train + offline
   eval pass; full UZH-FPV run is a standard GPU job).
-- **Pipeline A** data layer is CPU-verified (`python tests/test_action_tokenizer.py`,
-  `python tests/test_openvla_dataset.py`). The model load + training step are
-  written against OpenVLA's verified API but run on the lab GPU in the OpenVLA
-  env — they cannot be exercised on a 6 GB laptop.
+- **Pipeline A** data layer and the offline scorer's decode/scoring math are
+  CPU-verified (`python tests/test_action_tokenizer.py`,
+  `python tests/test_openvla_dataset.py`, `python tests/test_openvla_evaluator.py`).
+  The three training arms (`--init pretrained|scratch|prismatic`) and the
+  checkpoint-loading paths in `scripts/eval_openvla.py` are written against the
+  OpenVLA/Prismatic APIs but run on the lab GPU in the matching env — they cannot
+  be exercised on a 6 GB laptop.
