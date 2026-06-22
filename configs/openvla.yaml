@@ -12,8 +12,20 @@ model:
 data:
   dataset_root: "data/uzh_fpv"
   train_split: 0.9
-  predict_offset: 0           # predict the action at the observed frame
+  predict_offset: 0           # (velocity mode only) predict action at observed frame
   num_workers: 4
+
+  # Target for the single observed frame:
+  #   velocity  - instantaneous body-frame [vx,vy,vz,yaw_rate] from actions.npy.
+  #               NOT recoverable from one RGB frame (motion is invisible in a
+  #               single image) -> an ill-posed regression. Kept for comparison.
+  #   waypoint  - body-frame displacement to the pose `waypoint_horizon` frames
+  #               ahead [dx,dy,dz,dyaw] from poses.npy. Well-posed from a single
+  #               frame AND matches OpenVLA's native relative-EEF action, so the
+  #               pretrained prior transfers more directly. RECOMMENDED.
+  #               Needs poses.npy -> re-run scripts/convert_uzh_fpv.py.
+  target_mode: waypoint
+  waypoint_horizon: 8         # frames (~30Hz UZH-FPV => ~0.27s lookahead)
 
 training:
   output_dir: "outputs/openvla"

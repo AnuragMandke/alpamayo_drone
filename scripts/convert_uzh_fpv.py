@@ -13,7 +13,12 @@ Output (per chunk):
         traj_{sequence_name}_t{i:03d}/
             images/          # rgb_000.png ... (224x224 RGB)
             actions.npy      # (T, 4) float32  [vx, vy, vz, yaw_rate]
+            poses.npy        # (T, 7) float32  world [x,y,z,qx,qy,qz,qw] per frame
             instructions.txt # one natural-language goal per line
+
+poses.npy lets the OpenVLA pipeline derive body-frame displacement-waypoint
+targets (data.openvla_dataset, target_mode="waypoint") as a well-posed
+alternative to instantaneous velocity; Pipeline B ignores it.
 
 Note: chunk names follow {sequence_name}_t{i:03d}; the directory gets a
 "traj_" prefix because AirSimDroneDataset discovers trajectories via the
@@ -336,6 +341,11 @@ def convert_sequence(seq_dir: Path, dst_root: Path, chunk_size: int,
             continue
 
         chunk_actions = actions_full[action_idx[start:end]].astype(np.float32)
+        # World-frame pose per saved frame (nearest GT): [x,y,z,qx,qy,qz,qw].
+        # Lets the OpenVLA pipeline derive waypoint targets without reconversion.
+        chunk_poses = np.concatenate(
+            [positions[gt_idx[start:end]], quats[gt_idx[start:end]]], axis=1
+        ).astype(np.float32)
         traj_dir = dst_root / f"traj_{chunk_name}"
 
         if dry_run:
@@ -362,6 +372,7 @@ def convert_sequence(seq_dir: Path, dst_root: Path, chunk_size: int,
                 img.save(img_out / f"rgb_{t:03d}.png")
 
             np.save(traj_dir / "actions.npy", chunk_actions)
+            np.save(traj_dir / "poses.npy", chunk_poses)
             (traj_dir / "instructions.txt").write_text(
                 "\n".join(instructions), encoding="utf-8"
             )

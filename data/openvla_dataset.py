@@ -14,6 +14,10 @@ emit OpenVLA-style supervised examples:
 Drone 4-DoF [vx,vy,vz,yaw_rate] is normalized per-dim to [-1,1] using [1%,99%]
 quantiles (OpenVLA convention), embedded into the 7-DoF EEF layout, and
 tokenized with models.action_tokenizer.ActionTokenizer.
+
+PrismaticDroneDataset emits the same examples for the `--init prismatic` control
+arm, differing only in pixel format (a dinosiglip {"dino","siglip"} dict instead
+of a stacked 6-channel tensor).
 """
 
 import json
@@ -30,11 +34,58 @@ from models.action_tokenizer import ActionTokenizer, drone_to_openvla
 PROMPT = "In: What action should the robot take to {instruction}?\nOut:"
 
 
-def compute_drone_norm_stats(root: str, train_split: float = 0.9,
-                             seed: int = 42) -> dict:
+# ----------------------------------------------------------------------------
+# Target derivation
+#
+# "velocity"  : instantaneous body-frame [vx, vy, vz, yaw_rate] (read straight
+#               from actions.npy). NOT recoverable from a single RGB frame —
+#               motion is invisible in one image, so this is an ill-posed
+#               single-frame regression (see docs/OPENVLA.md).
+# "waypoint"  : body-frame displacement to the pose `horizon` steps ahead,
+#               [dx, dy, dz, dyaw] (derived from poses.npy). Well-posed from a
+#               single frame and semantically matches OpenVLA's native action
+#               (relative EEF translation), so the pretrained prior transfers
+#               more directly. Requires poses.npy (re-run convert_uzh_fpv.py).
+# ----------------------------------------------------------------------------
+
+def build_waypoint_targets(poses: np.ndarray, horizon: int) -> np.ndarray:
     """
-    Per-dim [1%, 99%] quantiles + min/max over the TRAIN trajectories.
-    Mirrors OpenVLA's dataset_statistics so actions normalize to ~[-1, 1].
+    poses: (T, 7) world-frame [x, y, z, qx, qy, qz, qw].
+    Returns (T - horizon, 4) body-frame [dx, dy, dz, dyaw]: the displacement to
+    the pose `horizon` steps ahead expressed in the body frame at t, plus the net
+    heading change. No dt (displacement, not a rate) — so it's free of the
+    finite-difference noise that plagues velocity targets.
+    """
+    from scipy.spatial.transform import Rotation
+    pos = poses[:, :3]
+    rot = Rotation.from_quat(poses[:, 3:7])
+    rot_inv = rot.inv()
+    n = len(poses) - horizon
+    out = np.zeros((n, 4), dtype=np.float32)
+    for t in range(n):
+        out[t, :3] = rot_inv[t].apply(pos[t + horizon] - pos[t])
+        out[t, 3] = (rot_inv[t] * rot[t + horizon]).as_euler("zyx")[0]
+    return out
+
+
+def _single_waypoint(poses: np.ndarray, t: int, horizon: int) -> np.ndarray:
+    """Body-frame [dx, dy, dz, dyaw] for one frame t (cheap; avoids rebuilding
+    the whole trajectory's targets on every __getitem__)."""
+    from scipy.spatial.transform import Rotation
+    rot = Rotation.from_quat(poses[[t, t + horizon], 3:7])   # R_t, R_{t+h}
+    out = np.zeros(4, dtype=np.float32)
+    out[:3] = rot[0].inv().apply(poses[t + horizon, :3] - poses[t, :3])
+    out[3] = (rot[0].inv() * rot[1]).as_euler("zyx")[0]
+    return out
+
+
+def compute_drone_norm_stats(root: str, train_split: float = 0.9,
+                             seed: int = 42, target_mode: str = "velocity",
+                             waypoint_horizon: int = 8) -> dict:
+    """
+    Per-dim [1%, 99%] quantiles + min/max over the TRAIN trajectories' targets.
+    Mirrors OpenVLA's dataset_statistics so targets normalize to ~[-1, 1].
+    `target_mode` selects velocity (actions.npy) vs waypoint (poses.npy).
     """
     root = Path(root)
     trajs = sorted((root / "trajectories").glob("traj_*"))
@@ -43,7 +94,12 @@ def compute_drone_norm_stats(root: str, train_split: float = 0.9,
     n_train = int(len(idx) * train_split)
     train_trajs = [trajs[i] for i in idx[:n_train]]
 
-    actions = np.concatenate([np.load(t / "actions.npy") for t in train_trajs], axis=0)
+    if target_mode == "waypoint":
+        actions = np.concatenate(
+            [build_waypoint_targets(np.load(t / "poses.npy"), waypoint_horizon)
+             for t in train_trajs], axis=0)
+    else:
+        actions = np.concatenate([np.load(t / "actions.npy") for t in train_trajs], axis=0)
     return {
         "q01": np.quantile(actions, 0.01, axis=0).tolist(),
         "q99": np.quantile(actions, 0.99, axis=0).tolist(),
@@ -76,12 +132,15 @@ class OpenVLADroneDataset(Dataset):
 
     def __init__(self, root, processor, action_tokenizer: ActionTokenizer,
                  norm_stats: dict, split: str = "train", train_split: float = 0.9,
-                 seed: int = 42, predict_offset: int = 0):
+                 seed: int = 42, predict_offset: int = 0,
+                 target_mode: str = "velocity", waypoint_horizon: int = 8):
         self.root = Path(root)
         self.processor = processor
         self.action_tokenizer = action_tokenizer
         self.norm_stats = norm_stats
         self.predict_offset = predict_offset   # action at t+offset for frame t
+        self.target_mode = target_mode
+        self.waypoint_horizon = waypoint_horizon
 
         trajs = sorted((self.root / "trajectories").glob("traj_*"))
         if not trajs:
@@ -92,21 +151,39 @@ class OpenVLADroneDataset(Dataset):
         sel = idx[:n_train] if split == "train" else idx[n_train:]
         selected = [trajs[i] for i in sel]
 
-        # Flat index of (traj, frame_t)
+        # Flat index of (traj, frame_t). Valid frames depend on the target: a
+        # waypoint needs the pose `horizon` ahead; a velocity needs t+offset.
         self.samples = []
         for traj in selected:
-            n = len(np.load(traj / "actions.npy"))
-            for t in range(n - predict_offset):
+            if target_mode == "waypoint":
+                poses_file = traj / "poses.npy"
+                if not poses_file.is_file():
+                    raise FileNotFoundError(
+                        f"target_mode='waypoint' needs {poses_file}, which is "
+                        "missing. Re-run scripts/convert_uzh_fpv.py to emit "
+                        "poses.npy alongside actions.npy.")
+                usable = len(np.load(poses_file)) - waypoint_horizon
+            else:
+                usable = len(np.load(traj / "actions.npy")) - predict_offset
+            for t in range(usable):
                 self.samples.append((traj, t))
         print(f"[OpenVLA-Dataset] {split}: {len(self.samples)} samples "
-              f"from {len(selected)} trajectories")
+              f"from {len(selected)} trajectories (target={target_mode})")
 
         self.eos_token_id = processor.tokenizer.eos_token_id
 
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, i):
+    def _raw_target(self, traj, t):
+        """The raw 4-DoF target for frame t (velocity or waypoint), pre-norm."""
+        if self.target_mode == "waypoint":
+            return _single_waypoint(np.load(traj / "poses.npy"), t,
+                                    self.waypoint_horizon)
+        return np.load(traj / "actions.npy")[t + self.predict_offset]
+
+    def _load_inputs(self, i):
+        """Processor-agnostic part: (PIL image, prompt str, action tokens (7,))."""
         traj, t = self.samples[i]
         img_files = sorted((traj / "images").glob("rgb_*.png"))
         image = Image.open(img_files[t]).convert("RGB")
@@ -115,15 +192,15 @@ class OpenVLADroneDataset(Dataset):
         instruction = random.choice(instrs) if instrs else "navigate to the goal"
         prompt = PROMPT.format(instruction=instruction)
 
-        action = np.load(traj / "actions.npy")[t + self.predict_offset]   # (4,)
-        norm = normalize_action(action, self.norm_stats)                  # (4,) in [-1,1]
-        action7 = drone_to_openvla(norm)                                  # (7,)
-        action_tokens = self.action_tokenizer(action7).astype(np.int64)   # (7,)
+        action = self._raw_target(traj, t)                               # (4,)
+        norm = normalize_action(action, self.norm_stats)                 # (4,) in [-1,1]
+        action7 = drone_to_openvla(norm)                                 # (7,)
+        action_tokens = self.action_tokenizer(action7).astype(np.int64)  # (7,)
+        return image, prompt, action_tokens
 
-        enc = self.processor(text=prompt, images=image, return_tensors="pt")
-        prompt_ids = enc["input_ids"][0]                  # (P,)
-        pixel_values = enc["pixel_values"][0]             # (6, 224, 224)
-
+    def _assemble(self, prompt_ids, action_tokens):
+        """prompt_ids (P,) + 7 action tokens + EOS -> (input_ids, labels); the
+        prompt positions are masked (-100) so only the action is supervised."""
         act_ids = torch.from_numpy(action_tokens)
         eos = torch.tensor([self.eos_token_id], dtype=torch.long)
         input_ids = torch.cat([prompt_ids, act_ids, eos])
@@ -131,6 +208,50 @@ class OpenVLADroneDataset(Dataset):
             torch.full((len(prompt_ids),), -100, dtype=torch.long),
             act_ids, eos,
         ])
+        return input_ids, labels
+
+    def __getitem__(self, i):
+        image, prompt, action_tokens = self._load_inputs(i)
+        enc = self.processor(text=prompt, images=image, return_tensors="pt")
+        prompt_ids = enc["input_ids"][0]                  # (P,)
+        input_ids, labels = self._assemble(prompt_ids, action_tokens)
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "pixel_values": enc["pixel_values"][0],       # (6, 224, 224)
+            "attention_mask": torch.ones_like(input_ids),
+        }
+
+
+class _TokenizerOnly:
+    """Shim so OpenVLADroneDataset.__init__ can read .tokenizer.eos_token_id when
+    handed a bare tokenizer (Prismatic path) instead of an HF processor."""
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+
+class PrismaticDroneDataset(OpenVLADroneDataset):
+    """Same supervised examples as OpenVLADroneDataset, but pixel_values come from
+    Prismatic's dinosiglip image_transform (a dict {"dino","siglip"} of
+    (3,224,224) tensors) rather than an HF processor's stacked (6,224,224).
+    Used by the `--init prismatic` control arm (build_prismatic_policy)."""
+
+    def __init__(self, root, tokenizer, image_transform, action_tokenizer,
+                 norm_stats, split: str = "train", train_split: float = 0.9,
+                 seed: int = 42, predict_offset: int = 0,
+                 target_mode: str = "velocity", waypoint_horizon: int = 8):
+        super().__init__(root, _TokenizerOnly(tokenizer), action_tokenizer,
+                         norm_stats, split=split, train_split=train_split,
+                         seed=seed, predict_offset=predict_offset,
+                         target_mode=target_mode, waypoint_horizon=waypoint_horizon)
+        self.tokenizer = tokenizer
+        self.image_transform = image_transform
+
+    def __getitem__(self, i):
+        image, prompt, action_tokens = self._load_inputs(i)
+        pixel_values = self.image_transform(image)        # dict of (3,224,224)
+        prompt_ids = self.tokenizer(prompt, return_tensors="pt")["input_ids"][0]
+        input_ids, labels = self._assemble(prompt_ids, action_tokens)
         return {
             "input_ids": input_ids,
             "labels": labels,
@@ -157,5 +278,32 @@ def make_openvla_collate(pad_token_id: int):
             "labels": labels,
             "attention_mask": attn,
             "pixel_values": torch.stack([b["pixel_values"] for b in batch]),
+        }
+    return collate
+
+
+def make_prismatic_collate(pad_token_id: int):
+    """Like make_openvla_collate, but pixel_values is a dict of tensors (Prismatic
+    dinosiglip {"dino","siglip"}); stack each key into a batch tensor."""
+    def collate(batch):
+        maxlen = max(b["input_ids"].shape[0] for b in batch)
+        B = len(batch)
+        input_ids = torch.full((B, maxlen), pad_token_id, dtype=torch.long)
+        labels = torch.full((B, maxlen), -100, dtype=torch.long)
+        attn = torch.zeros((B, maxlen), dtype=torch.long)
+        for i, b in enumerate(batch):
+            L = b["input_ids"].shape[0]
+            input_ids[i, :L] = b["input_ids"]
+            labels[i, :L] = b["labels"]
+            attn[i, :L] = b["attention_mask"]
+        pixel_values = {
+            k: torch.stack([b["pixel_values"][k] for b in batch])
+            for k in batch[0]["pixel_values"]
+        }
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attn,
+            "pixel_values": pixel_values,
         }
     return collate
