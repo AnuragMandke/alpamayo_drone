@@ -10,10 +10,24 @@
 # Key differences from configs/openvla.yaml:
 #   - precision: fp16   T4/P100 have NO bf16 tensor cores. bf16 there errors or
 #                       falls back to a slow emulation, so fp16 is mandatory.
-#   - target_mode: velocity   runs against the existing data/uzh_fpv (no poses.npy).
-#                       Waypoint mode is the meaningful target but needs a re-run of
-#                       scripts/convert_uzh_fpv.py to emit poses.npy first.
+#   (target_mode is now `waypoint`, same as the lab config — see below.)
 #   - max_steps + tiny batch   quick feedback within the free-tier session limit.
+#
+# WHY NOT velocity: the 2026-07-16 smoke ran velocity and plateaued at 2.450 nats.
+# A model that learned ONLY the marginal action distribution — nothing from the
+# image — scores 2.563 on this data, so it had learned almost nothing conditional.
+# That is inherent, not undertraining: instantaneous velocity is invisible in one
+# static frame (see data/openvla_dataset.py:40-48). In velocity mode ALL THREE
+# ablation arms converge to ~2.56 regardless of pretraining, i.e. a null result by
+# construction. Waypoint is well-posed from a single frame AND matches OpenVLA's
+# native action semantics (relative EEF translation).
+#
+# YARDSTICK for reading a waypoint run: the marginal-only floor is 2.554 nats.
+# Meaningfully below that = the model is using the image. At/above it = it is not.
+# NOTE the reported loss is diluted ~2x: it averages 8 supervised positions, but
+# drone_to_openvla writes constant zeros into roll/pitch/gripper, so 3 of the 7
+# action tokens + EOS are free to predict. Only dims [0,1,2,5] carry drone data.
+# The offline eval should score those 4 dims only.
 #
 # The scratch/prismatic control arms need >=24GB bf16 and will NOT fit a T4 — run
 # those on the lab GPU with configs/openvla.yaml.
@@ -30,7 +44,7 @@ data:
   train_split: 0.9
   predict_offset: 0
   num_workers: 2              # Colab CPUs are limited
-  target_mode: velocity      # no poses.npy needed; see header note
+  target_mode: waypoint      # matches the lab config; see header note
   waypoint_horizon: 8
 
 training:

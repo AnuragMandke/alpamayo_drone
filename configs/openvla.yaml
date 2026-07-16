@@ -25,7 +25,16 @@ data:
   #               pretrained prior transfers more directly. RECOMMENDED.
   #               Needs poses.npy -> re-run scripts/convert_uzh_fpv.py.
   target_mode: waypoint
-  waypoint_horizon: 8         # frames (~30Hz UZH-FPV => ~0.27s lookahead)
+  waypoint_horizon: 8         # frames. Measured 2026-07-16: median frame dt is
+                              # 0.0339s (29.5Hz), so ~0.27s nominal — BUT UZH-FPV
+                              # drops frames (dt p90 = 0.0657s, ~2x), so this is a
+                              # VARIABLE time horizon: the worst observed 8-frame
+                              # window spans 0.43s. poses.npy carries no timestamps
+                              # to correct for it, so the target has an irreducible
+                              # noise floor. It hits all three arms equally, so the
+                              # ablation comparison stays valid — but it caps how
+                              # low any arm's loss can go. Fixing it needs the
+                              # converter to emit per-frame timestamps.
 
 training:
   output_dir: "outputs/openvla"

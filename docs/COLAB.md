@@ -5,7 +5,7 @@ transfer arm** in 4-bit as a smoke test — enough to prove the model loads and
 trains a few steps without OOM/dtype errors, and to burn down the *pending
 lab-GPU validation* blocker before booking the real GPU.
 
-> **Scope.** This is a ~50-step smoke run in `velocity` mode. It is **not** a
+> **Scope.** This is a ~50-step smoke run in `waypoint` mode. It is **not** a
 > result. The `scratch` and `prismatic` control arms need **>=24 GB bf16** and
 > will not fit a T4 — run the real 3-arm ablation on the lab GPU with
 > `configs/openvla.yaml` (see [OPENVLA.md](OPENVLA.md)).
@@ -21,7 +21,7 @@ commands** below (same steps, if you prefer to paste cells yourself).
 |---|---|
 | Turing has **no bf16 tensor cores** | Must train in **fp16**. `configs/openvla_colab.yaml` sets `precision: fp16`; the trainer adds an fp16 GradScaler automatically. |
 | 16 GB VRAM | Only the **4-bit pretrained** arm fits. `scratch`/`prismatic` (24 GB bf16) are lab-GPU only. |
-| `data/uzh_fpv/` has no `poses.npy` | Smoke uses `target_mode: velocity`. Waypoint mode (the meaningful target) needs a local re-run of `scripts/convert_uzh_fpv.py` first. |
+| ~~no `poses.npy`~~ (fixed 2026-07-16) | Re-converted data now ships `poses.npy`, so the smoke runs `target_mode: waypoint`, same as the lab config. **Do not fall back to `velocity`:** it is ill-posed from a single frame (motion is invisible in one image), so every arm converges to the marginal (~2.56 nats) and the ablation returns a null result by construction. |
 | Ephemeral disk, session limits | Weights (~15 GB) re-download every session; the `max_steps: 50` cap keeps the run short enough to finish in one. |
 
 The dtype is flag-gated (`training.precision: bf16 | fp16 | fp32`), so this
@@ -158,4 +158,4 @@ os.environ['HF_HOME'] = '/content/hf_cache'
 | `training.precision` | `fp16` | **T4-mandatory.** `bf16` on the lab GPU, `fp32` to debug. |
 | `training.max_steps` | `50` | Optimizer-step cap; remove for a full epoch. |
 | `training.batch_size` | `4` | Raise on bigger VRAM, lower on OOM. |
-| `data.target_mode` | `velocity` | Switch to `waypoint` only after regenerating `poses.npy`. |
+| `data.target_mode` | `waypoint` | Leave it. `velocity` is ill-posed from one frame — see the constraints table. |
