@@ -132,9 +132,14 @@ os.environ['HF_HOME'] = '/content/hf_cache'
 
 - `[Train] precision=torch.float16 (autocast=on)` near the top.
 - Trainable-params line shows only LoRA adapters (<1 % of the model).
-- A finite, non-NaN `loss=` that trends **down** over 50 steps, ending with
-  `[max_steps=50 reached — stopping]` and a saved
-  `outputs/openvla/pretrained/epoch001`.
+- A finite, non-NaN `loss=` that drops sharply over the first ~15 steps and then
+  **plateaus** (~2–3 nats). The `loss=` line is a *windowed* mean, so a plateau is
+  the honest picture and is expected here: 50 steps x batch 4 is 200 samples, under
+  2 % of one epoch. Do not read the plateau as failure — and do not read a smooth
+  glide as success, which is what the old cumulative-mean log used to show.
+- Ends with `[max_steps=50 reached — stopping]` and a saved
+  `outputs/openvla/pretrained/epoch001` (~130 MB — adapters only; a much larger
+  directory means the base got saved too, which is a bug).
 
 ## Troubleshooting
 

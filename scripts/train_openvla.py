@@ -171,6 +171,13 @@ def main():
     stop = False
     for epoch in range(1, tc["epochs"] + 1):
         running = 0.0
+        # The step log reports a WINDOWED mean (reset at every log), not a mean
+        # cumulative over the epoch. A cumulative mean is a lagging indicator: it
+        # keeps gliding down long after training has plateaued, because it is
+        # still shedding the high early values. That reads as a healthy curve
+        # when nothing is happening, and across the ablation's three arms it
+        # would blur the real differences under a shared early transient.
+        window, window_n = 0.0, 0
         optim.zero_grad()
         for i, batch in enumerate(loader):
             batch = move_batch(batch, device, amp_dtype)
@@ -183,20 +190,25 @@ def main():
                 )
                 loss = out.loss / grad_accum
             scaler.scale(loss).backward()
-            running += loss.item() * grad_accum
+            batch_loss = loss.item() * grad_accum
+            running += batch_loss
+            window += batch_loss
+            window_n += 1
 
             if (i + 1) % grad_accum == 0:
                 scaler.unscale_(optim)
                 torch.nn.utils.clip_grad_norm_(trainable_parameters(model), tc["max_grad_norm"])
                 scaler.step(optim); scaler.update(); optim.zero_grad(); step += 1
                 if step % tc["log_every_n_steps"] == 0:
-                    print(f"  epoch {epoch} step {step}  loss={running / (i + 1):.4f}", flush=True)
+                    print(f"  epoch {epoch} step {step}  loss={window / max(window_n, 1):.4f}"
+                          f"  (mean of last {window_n} batches)", flush=True)
+                    window, window_n = 0.0, 0
                 if max_steps and step >= max_steps:
                     print(f"  [max_steps={max_steps} reached — stopping]", flush=True)
                     stop = True
                     break
 
-        print(f"Epoch {epoch}/{tc['epochs']}  loss={running / (i + 1):.4f}", flush=True)
+        print(f"Epoch {epoch}/{tc['epochs']}  epoch_mean_loss={running / (i + 1):.4f}", flush=True)
         if epoch % tc["save_every_n_epochs"] == 0 or epoch == tc["epochs"]:
             ckpt = out_dir / f"epoch{epoch:03d}"
             ckpt.mkdir(exist_ok=True)

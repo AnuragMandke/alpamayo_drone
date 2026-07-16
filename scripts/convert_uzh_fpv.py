@@ -53,8 +53,19 @@ from tqdm import tqdm
 # Constants
 # ------------------------------------------------------------------
 IMAGE_SIZE = (224, 224)
-VEL_CLIP = 5.0            # m/s for vx, vy, vz
-YAW_RATE_CLIP = 3.14      # rad/s
+# These clips are a guard against NUMERICAL SPIKES ONLY (finite differencing a
+# near-zero dt, or a GT glitch) — they must sit ABOVE the real flight envelope.
+# Shaping the action distribution is the job of the q01/q99 percentile
+# normalization in data/openvla_dataset.py, which derives its range from the data.
+#
+# They were 5.0 m/s and 3.14 rad/s, which is BELOW what UZH-FPV actually flies —
+# it is a racing dataset that exceeds 10 m/s. That saturated the data: the stats
+# from the first Colab run had q99 == max == 5.0 on vx/vy/vz (>=1% of samples on
+# the boundary exactly) and vx mean 3.33 / std 1.71, i.e. the ceiling sat under
+# 1 sigma above the mean — roughly 16% of forward velocities collapsed onto one
+# value, which normalization then mapped to a single repeated action token.
+VEL_CLIP = 20.0           # m/s for vx, vy, vz — above UZH-FPV's true top speed
+YAW_RATE_CLIP = 10.0      # rad/s — a racing drone exceeds pi rad/s in a turn
 MAX_ALIGN_DIST_S = 0.05   # max image-to-GT timestamp distance
 MAX_BAD_FRAC = 0.10       # skip chunk if more frames than this misalign
 
