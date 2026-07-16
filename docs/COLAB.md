@@ -81,18 +81,25 @@ cell.
 ```
 
 **3. Install the OpenVLA deps** — OpenVLA's `trust_remote_code` needs
-**transformers 4.40.1**. Do **not** reinstall torch/torchvision: Colab's build
-is matched to the runtime CUDA, and replacing it from PyPI usually breaks the GPU.
+**transformers 4.40.1**, and `accelerate`/`peft` must be pinned to that same era
+(see the version-skew row in [Troubleshooting](#troubleshooting) — a `>=` floor
+here is what makes the run die after the full 15 GB load). Do **not** reinstall
+torch/torchvision: Colab's build is matched to the runtime CUDA, and replacing it
+from PyPI usually breaks the GPU.
 
 ```python
 !pip install -q \
   "transformers==4.40.1" "tokenizers>=0.19,<0.20" "timm==0.9.10" \
-  "accelerate>=0.29.0" "peft>=0.11.0" "bitsandbytes>=0.43.0" \
+  "accelerate==0.29.3" "peft==0.11.1" "bitsandbytes>=0.43.0" \
   "Pillow>=10.0.0" "PyYAML>=6.0"
+
+import transformers, accelerate, peft
+print(transformers.__version__, accelerate.__version__, peft.__version__)
+# expect: 4.40.1 0.29.3 0.11.1
 ```
 
-If Colab had already imported `transformers`, do **Runtime → Restart session**
-and re-run from step 2.
+If that prints anything else, Colab had already imported the modules and pip
+could not replace them: **Runtime → Restart session**, then re-run from step 2.
 
 **4. Bring the data over from Drive**
 
@@ -133,6 +140,7 @@ os.environ['HF_HOME'] = '/content/hf_cache'
 
 | Symptom | Fix |
 |---|---|
+| ``ValueError: `.to` is not supported for `4-bit` or `8-bit` bitsandbytes models`` — raised at the end of `from_pretrained`, after all 3 shards load | **Version skew: your `accelerate` is newer than `transformers==4.40.1`.** Since bitsandbytes 0.43.2, 4-bit models can be moved with `.to()`, so a modern accelerate `dispatch_model` skips the hook path and moves the model directly — but 4.40.1's `.to()` rejects any move of a quantized model. Re-run the install cell with `accelerate==0.29.3` pinned and **restart the session**; confirm with the version print. |
 | `CUDA out of memory` | Lower `batch_size` to 2 (or 1) in `configs/openvla_colab.yaml`. |
 | `loss=nan` | fp16 underflow; the GradScaler should catch it, but if it persists drop `optimizer.lr` and/or `batch_size`. |
 | bf16 error inside the OpenVLA remote code | The remote `modeling_prismatic.py` may hardcode a bf16 path in the vision tower. That's exactly the finding this smoke test exists to surface — report it; the fix is a small patch forcing the vision dtype. |

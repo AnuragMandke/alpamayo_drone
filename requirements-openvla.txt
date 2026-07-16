@@ -19,9 +19,16 @@ torchvision
 transformers==4.40.1          # pinned: OpenVLA remote code requires this API
 tokenizers>=0.19,<0.20
 timm==0.9.10                  # DINOv2 + SigLIP vision backbones
-accelerate>=0.29.0
-peft>=0.11.0                  # LoRA on the OpenVLA backbone
-bitsandbytes>=0.43.0          # 4-bit QLoRA to fit smaller GPUs
+# accelerate/peft are PINNED, not floored: they must stay in the transformers 4.40.1
+# era. A floor (>=) silently keeps whatever a host already ships (Colab: accelerate
+# 1.14), and modern accelerate skips the dispatch-hook path for 4-bit bnb models —
+# it moves them with .to() instead, which 4.40.1's .to() rejects outright, so
+# from_pretrained dies AFTER the full 15GB load. Bump these only with transformers.
+accelerate==0.29.3
+peft==0.11.1                  # LoRA on the OpenVLA backbone
+bitsandbytes>=0.43.0          # 4-bit QLoRA to fit smaller GPUs; kept current on
+                              # purpose — it is a compiled CUDA lib and needs to
+                              # match the host's driver, unlike the two above
 numpy>=1.26.0
 Pillow>=10.0.0
 PyYAML>=6.0

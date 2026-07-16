@@ -81,6 +81,9 @@ def build_openvla_policy(
             # with .to(), and the train loop's batch.to("cuda") then mismatches.
             # Pin to a single GPU ({"": 0}) rather than "auto" so a 7B model is
             # never split across CPU/GPU (which breaks the LoRA/checkpoint path).
+            # This dispatch is why accelerate is PINNED (requirements-openvla.txt):
+            # accelerate >=0.33 with bnb >=0.43.2 dispatches a single-device 4-bit
+            # model via .to(), which transformers 4.40.1 refuses -> load fails here.
             device_map={"": 0} if bnb is not None else None,
             torch_dtype=compute_dtype,
             low_cpu_mem_usage=True,
