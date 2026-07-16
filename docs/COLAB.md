@@ -21,8 +21,8 @@ commands** below (same steps, if you prefer to paste cells yourself).
 |---|---|
 | Turing has **no bf16 tensor cores** | Must train in **fp16**. `configs/openvla_colab.yaml` sets `precision: fp16`; the trainer adds an fp16 GradScaler automatically. |
 | 16 GB VRAM | Only the **4-bit pretrained** arm fits. `scratch`/`prismatic` (24 GB bf16) are lab-GPU only. |
-| ~~no `poses.npy`~~ (fixed 2026-07-16) | Re-converted data now ships `poses.npy`, so the smoke runs `target_mode: waypoint`, same as the lab config. **Do not fall back to `velocity`:** it is ill-posed from a single frame (motion is invisible in one image), so every arm converges to the marginal (~2.56 nats) and the ablation returns a null result by construction. |
-| Ephemeral disk, session limits | Weights (~15 GB) re-download every session; the `max_steps: 50` cap keeps the run short enough to finish in one. |
+| ~~no `poses.npy`~~ (fixed 2026-07-16) | Re-converted data now ships `poses.npy`, so the smoke runs `target_mode: waypoint`, same as the lab config. **Do not fall back to `velocity`:** it is ill-posed from a single frame (motion is invisible in one image), so every arm converges to the marginal (~2.58 nats) and the ablation returns a null result by construction. |
+| Ephemeral disk, session limits | Weights (~15 GB) re-download every session; the `max_steps: 600` cap keeps the run to ~50 min, short enough to finish in one. |
 
 The dtype is flag-gated (`training.precision: bf16 | fp16 | fp32`), so this
 changes nothing for the lab GPU — that path still defaults to bf16.
@@ -130,16 +130,35 @@ os.environ['HF_HOME'] = '/content/hf_cache'
 
 ## What success looks like
 
-- `[Train] precision=torch.float16 (autocast=on)` near the top.
-- Trainable-params line shows only LoRA adapters (<1 % of the model).
-- A finite, non-NaN `loss=` that drops sharply over the first ~15 steps and then
-  **plateaus** (~2–3 nats). The `loss=` line is a *windowed* mean, so a plateau is
-  the honest picture and is expected here: 50 steps x batch 4 is 200 samples, under
-  2 % of one epoch. Do not read the plateau as failure — and do not read a smooth
-  glide as success, which is what the old cumulative-mean log used to show.
-- Ends with `[max_steps=50 reached — stopping]` and a saved
+- `[Train] precision=torch.float16 (autocast=on)` and `target_mode=waypoint` near the top.
+- `[Train] marginal-only loss floor = 2.563 nats`, computed from your train split.
+  **This is the number the run is read against** (see below).
+- Trainable-params line shows only LoRA adapters (33.5 M / 7.57 B = 0.44 %).
+- A finite, non-NaN `loss=` ending in `(mean of last N batches)`. It is a *windowed*
+  mean, so a plateau is the honest picture — do not read a smooth glide as success,
+  which is what the old cumulative-mean log showed.
+- Ends with `[max_steps=600 reached — stopping]` and a saved
   `outputs/openvla/pretrained/epoch001` (~130 MB — adapters only; a much larger
   directory means the base got saved too, which is a bug).
+
+### The number that matters
+
+The **marginal-only floor** is what a model scores knowing the action distribution
+but ignoring the image entirely. The 600-step probe (~50 min, 2400 samples) exists to
+answer one question: **does the loss break below it?**
+
+| Outcome | Meaning |
+|---|---|
+| Breaks below (~2.3 or lower) | The model is using the camera. Book the lab GPU. |
+| Stalls at ~2.56 | It learned the action prior and nothing about what it sees. Prime suspect: `LORA_TARGETS` is attention-only (q/k/v/o_proj) where OpenVLA's official recipe uses `all-linear` incl. MLP. |
+
+Both 50-step runs landed ~0.1 nats below their floor (velocity 2.450 vs 2.576;
+waypoint 2.482 vs 2.563) — essentially at the marginal, which is all 200 samples buys.
+
+The reported loss is **diluted ~2x**: it averages 8 supervised positions, but
+`drone_to_openvla` writes constant zeros into roll/pitch/gripper, so 3 of the 7 action
+tokens plus EOS are free to predict. Only dims `[0,1,2,5]` carry drone data — the
+offline eval should score those 4 alone, or the effect size between arms is halved.
 
 ## Troubleshooting
 

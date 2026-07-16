@@ -15,15 +15,16 @@
 #
 # WHY NOT velocity: the 2026-07-16 smoke ran velocity and plateaued at 2.450 nats.
 # A model that learned ONLY the marginal action distribution — nothing from the
-# image — scores 2.563 on this data, so it had learned almost nothing conditional.
+# image — scores 2.576 on this data, so it had learned almost nothing conditional.
 # That is inherent, not undertraining: instantaneous velocity is invisible in one
 # static frame (see data/openvla_dataset.py:40-48). In velocity mode ALL THREE
-# ablation arms converge to ~2.56 regardless of pretraining, i.e. a null result by
+# ablation arms converge to ~2.58 regardless of pretraining, i.e. a null result by
 # construction. Waypoint is well-posed from a single frame AND matches OpenVLA's
 # native action semantics (relative EEF translation).
 #
-# YARDSTICK for reading a waypoint run: the marginal-only floor is 2.554 nats.
-# Meaningfully below that = the model is using the image. At/above it = it is not.
+# YARDSTICK: the trainer PRINTS the marginal-only floor at startup, computed from
+# the train split (waypoint: 2.563). Meaningfully below it = the model is using the
+# image; at/above it = it is not. Read every run against the printed number.
 # NOTE the reported loss is diluted ~2x: it averages 8 supervised positions, but
 # drone_to_openvla writes constant zeros into roll/pitch/gripper, so 3 of the 7
 # action tokens + EOS are free to predict. Only dims [0,1,2,5] carry drone data.
@@ -52,7 +53,12 @@ training:
   seed: 42
   precision: fp16            # <-- T4-critical; bf16 has no HW support on Turing
   epochs: 1
-  max_steps: 50             # smoke cap: stop after 50 optimizer steps
+  # 2026-07-16: raised 50 -> 600 (~50 min on a T4 at ~12 steps/min, 2400 samples,
+  # still <1 epoch of 2938). 50 steps only proved the plumbing: both 50-step runs
+  # sat at the marginal floor, which is what 200 samples buys either way, so they
+  # could not answer whether the pipeline learns from pixels at all. THIS run can:
+  # watch for the loss to break below the printed marginal floor (2.563).
+  max_steps: 600
   batch_size: 4             # fits a T4 with the 4-bit base; raise if VRAM allows
   gradient_accumulation_steps: 1   # step == batch, for fast smoke feedback
   max_grad_norm: 1.0
@@ -60,4 +66,5 @@ training:
     lr: 5.0e-4
     weight_decay: 0.0
   save_every_n_epochs: 1
-  log_every_n_steps: 5
+  log_every_n_steps: 20     # 30 log lines over 600 steps; a 20-batch window is
+                            # also less noisy than 5 when reading for a trend

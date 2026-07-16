@@ -89,7 +89,7 @@ def main():
     from models.action_tokenizer import ActionTokenizer
     from data.openvla_dataset import (
         OpenVLADroneDataset, PrismaticDroneDataset, compute_drone_norm_stats,
-        make_openvla_collate, make_prismatic_collate,
+        make_openvla_collate, make_prismatic_collate, marginal_loss_floor,
     )
 
     is_prismatic = args.init == "prismatic"
@@ -128,6 +128,18 @@ def main():
     json.dump(stats, open(out_dir / "drone_norm_stats.json", "w"), indent=2)
     print(f"[Train] target_mode={target_mode}"
           + (f" horizon={waypoint_horizon}" if target_mode == "waypoint" else ""))
+
+    # Print the yardstick for reading the loss BEFORE any of it scrolls past: a
+    # model that ignores the image and predicts the marginal action distribution
+    # scores this. A run that settles here has learned nothing from the camera.
+    floor, H = marginal_loss_floor(
+        dc["dataset_root"], stats, dc["train_split"], tc["seed"],
+        target_mode=target_mode, waypoint_horizon=waypoint_horizon,
+    )
+    print(f"[Train] marginal-only loss floor = {floor:.3f} nats "
+          f"— a model ignoring the image scores this; below it = using the image")
+    print(f"[Train]   per-dim entropy: {[round(h, 2) for h in H]} nats "
+          f"(floor = sum/8: 3 constant pad dims + EOS are free)")
 
     atok = ActionTokenizer(tokenizer)
     pad_id = tokenizer.pad_token_id or 0

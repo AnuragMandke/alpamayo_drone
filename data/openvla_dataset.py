@@ -29,7 +29,9 @@ import torch
 from torch.utils.data import Dataset
 from PIL import Image
 
-from models.action_tokenizer import ActionTokenizer, drone_to_openvla
+from models.action_tokenizer import (
+    ActionTokenizer, drone_to_openvla, OPENVLA_ACTION_DIM,
+)
 
 PROMPT = "In: What action should the robot take to {instruction}?\nOut:"
 
@@ -79,14 +81,10 @@ def _single_waypoint(poses: np.ndarray, t: int, horizon: int) -> np.ndarray:
     return out
 
 
-def compute_drone_norm_stats(root: str, train_split: float = 0.9,
-                             seed: int = 42, target_mode: str = "velocity",
-                             waypoint_horizon: int = 8) -> dict:
-    """
-    Per-dim [1%, 99%] quantiles + min/max over the TRAIN trajectories' targets.
-    Mirrors OpenVLA's dataset_statistics so targets normalize to ~[-1, 1].
-    `target_mode` selects velocity (actions.npy) vs waypoint (poses.npy).
-    """
+def _train_targets(root: str, train_split: float, seed: int,
+                   target_mode: str, waypoint_horizon: int) -> np.ndarray:
+    """(N, 4) raw targets over the TRAIN trajectories. Shared by the norm stats
+    and the marginal-loss floor so both see exactly the same split."""
     root = Path(root)
     trajs = sorted((root / "trajectories").glob("traj_*"))
     rng = random.Random(seed)
@@ -95,11 +93,53 @@ def compute_drone_norm_stats(root: str, train_split: float = 0.9,
     train_trajs = [trajs[i] for i in idx[:n_train]]
 
     if target_mode == "waypoint":
-        actions = np.concatenate(
+        return np.concatenate(
             [build_waypoint_targets(np.load(t / "poses.npy"), waypoint_horizon)
              for t in train_trajs], axis=0)
-    else:
-        actions = np.concatenate([np.load(t / "actions.npy") for t in train_trajs], axis=0)
+    return np.concatenate([np.load(t / "actions.npy") for t in train_trajs], axis=0)
+
+
+def marginal_loss_floor(root: str, stats: dict, train_split: float = 0.9,
+                        seed: int = 42, target_mode: str = "velocity",
+                        waypoint_horizon: int = 8, bins: int = 256):
+    """
+    The mean CE a model scores by predicting the MARGINAL action distribution and
+    ignoring the image entirely. This is the yardstick for reading a training
+    curve: a run that settles here has learned the action prior and NOTHING about
+    what the camera sees, however smooth its loss looks.
+
+    Why it is (sum of per-dim entropies)/8 and not their mean: the labels
+    supervise 7 action tokens + EOS = 8 positions, but drone_to_openvla writes a
+    constant 0.0 into roll/pitch/gripper on every sample, so those 3 dims — and
+    EOS — carry ~no entropy and are free once learned. Only the 4 dims at
+    DRONE_TO_OPENVLA_IDX carry drone data, so the reported loss is diluted ~2x
+    relative to the error on the dims that matter. (Measured 2026-07-16 on the
+    TRAIN split: velocity floor 2.576 vs a 50-step run that plateaued at 2.450;
+    waypoint floor 2.563 vs 2.482. Both runs were ~0.1 nats off their floor, i.e.
+    at 200 samples neither had learned anything much from the image.)
+
+    Returns (floor_nats, per_dim_entropies).
+    """
+    targets = _train_targets(root, train_split, seed, target_mode, waypoint_horizon)
+    norm = normalize_action(targets, stats)
+    edges = np.linspace(-1.0, 1.0, bins)          # mirrors ActionTokenizer.bins
+    H = []
+    for d in range(norm.shape[1]):
+        _, counts = np.unique(np.digitize(norm[:, d], edges), return_counts=True)
+        p = counts / counts.sum()
+        H.append(float(-(p * np.log(p)).sum()))
+    return sum(H) / (OPENVLA_ACTION_DIM + 1), H
+
+
+def compute_drone_norm_stats(root: str, train_split: float = 0.9,
+                             seed: int = 42, target_mode: str = "velocity",
+                             waypoint_horizon: int = 8) -> dict:
+    """
+    Per-dim [1%, 99%] quantiles + min/max over the TRAIN trajectories' targets.
+    Mirrors OpenVLA's dataset_statistics so targets normalize to ~[-1, 1].
+    `target_mode` selects velocity (actions.npy) vs waypoint (poses.npy).
+    """
+    actions = _train_targets(root, train_split, seed, target_mode, waypoint_horizon)
     return {
         "q01": np.quantile(actions, 0.01, axis=0).tolist(),
         "q99": np.quantile(actions, 0.99, axis=0).tolist(),
