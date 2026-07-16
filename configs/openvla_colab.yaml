@@ -1,0 +1,49 @@
+# OpenVLA smoke-test config for a FREE Colab/Kaggle T4 (16GB, Turing).
+#
+# Purpose: prove the *pretrained* transfer arm loads in 4-bit and trains a few
+# steps on a T4 without OOM/dtype errors — burning down the "pending lab-GPU
+# validation" blocker. This is NOT a result-producing run; see configs/openvla.yaml
+# for the real ablation on the lab GPU.
+#
+#   python scripts/train_openvla.py --config configs/openvla_colab.yaml --init pretrained
+#
+# Key differences from configs/openvla.yaml:
+#   - precision: fp16   T4/P100 have NO bf16 tensor cores. bf16 there errors or
+#                       falls back to a slow emulation, so fp16 is mandatory.
+#   - target_mode: velocity   runs against the existing data/uzh_fpv (no poses.npy).
+#                       Waypoint mode is the meaningful target but needs a re-run of
+#                       scripts/convert_uzh_fpv.py to emit poses.npy first.
+#   - max_steps + tiny batch   quick feedback within the free-tier session limit.
+#
+# The scratch/prismatic control arms need >=24GB bf16 and will NOT fit a T4 — run
+# those on the lab GPU with configs/openvla.yaml.
+
+model:
+  load_in_4bit: true          # 4-bit QLoRA — the only arm that fits a 16GB T4
+  lora:
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+
+data:
+  dataset_root: "data/uzh_fpv"
+  train_split: 0.9
+  predict_offset: 0
+  num_workers: 2              # Colab CPUs are limited
+  target_mode: velocity      # no poses.npy needed; see header note
+  waypoint_horizon: 8
+
+training:
+  output_dir: "outputs/openvla"
+  seed: 42
+  precision: fp16            # <-- T4-critical; bf16 has no HW support on Turing
+  epochs: 1
+  max_steps: 50             # smoke cap: stop after 50 optimizer steps
+  batch_size: 4             # fits a T4 with the 4-bit base; raise if VRAM allows
+  gradient_accumulation_steps: 1   # step == batch, for fast smoke feedback
+  max_grad_norm: 1.0
+  optimizer:
+    lr: 5.0e-4
+    weight_decay: 0.0
+  save_every_n_epochs: 1
+  log_every_n_steps: 5

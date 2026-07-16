@@ -41,13 +41,13 @@ LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 PRISMATIC_ID = "prism-dinosiglip-224px+7b"
 
 
-def _bnb_config():
+def _bnb_config(compute_dtype=torch.bfloat16):
     from transformers import BitsAndBytesConfig
     return BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_compute_dtype=compute_dtype,
     )
 
 
@@ -57,15 +57,20 @@ def build_openvla_policy(
     lora_rank: int = 32,
     lora_alpha: int = 64,
     lora_dropout: float = 0.0,
+    compute_dtype=torch.bfloat16,      # torch.float16 on Turing (T4): no bf16 HW
 ):
     """
     Returns (model, processor). The model exposes the native OpenVLA forward
     (returns .loss when `labels` are passed) and .predict_action for eval.
+
+    compute_dtype selects the activation/weight dtype. Ampere+ (A100, 30xx/40xx,
+    lab GPU) supports torch.bfloat16 — the default. Turing GPUs (Colab/Kaggle T4)
+    and Pascal (P100) have no bf16 tensor cores, so pass torch.float16 there.
     """
     from transformers import AutoModelForVision2Seq, AutoProcessor, AutoConfig
 
     processor = AutoProcessor.from_pretrained(OPENVLA_ID, trust_remote_code=True)
-    bnb = _bnb_config() if load_in_4bit else None
+    bnb = _bnb_config(compute_dtype) if load_in_4bit else None
 
     if init == "pretrained":
         model = AutoModelForVision2Seq.from_pretrained(
@@ -77,7 +82,7 @@ def build_openvla_policy(
             # Pin to a single GPU ({"": 0}) rather than "auto" so a 7B model is
             # never split across CPU/GPU (which breaks the LoRA/checkpoint path).
             device_map={"": 0} if bnb is not None else None,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=compute_dtype,
             low_cpu_mem_usage=True,
             trust_remote_code=True,
         )
@@ -94,7 +99,7 @@ def build_openvla_policy(
         # bound; the Prismatic VLM base is the stronger gold-standard control.
         config = AutoConfig.from_pretrained(OPENVLA_ID, trust_remote_code=True)
         model = AutoModelForVision2Seq.from_config(config, trust_remote_code=True)
-        model = model.to(torch.bfloat16)
+        model = model.to(compute_dtype)
         model = _apply_lora(model, lora_rank, lora_alpha, lora_dropout, quantized=False)
         print(f"[OpenVLA] random init + LoRA(r={lora_rank}) — from-scratch control arm")
 
