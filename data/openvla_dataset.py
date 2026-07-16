@@ -87,12 +87,33 @@ def _train_targets(root: str, train_split: float, seed: int,
     and the marginal-loss floor so both see exactly the same split."""
     root = Path(root)
     trajs = sorted((root / "trajectories").glob("traj_*"))
+    if not trajs:
+        # Without this, the empty list reaches np.concatenate and surfaces as
+        # "need at least one array to concatenate" — which says nothing about the
+        # actual cause. On Colab the usual cause is that the data never got
+        # extracted, or that re-running the clone cell deleted it (the dataset
+        # lives inside the repo dir, so `rm -rf` takes it with the code).
+        raise FileNotFoundError(
+            f"No trajectories found at {(root / 'trajectories').resolve()} "
+            f"(looking for traj_*/). On Colab: re-run the Drive/extract cell — "
+            f"the clone cell wipes the repo dir, and the dataset lives inside it. "
+            f"Locally: python scripts/convert_uzh_fpv.py --src data/raw/uzh_fpv "
+            f"--dst {root}"
+        )
     rng = random.Random(seed)
     idx = list(range(len(trajs))); rng.shuffle(idx)
     n_train = int(len(idx) * train_split)
     train_trajs = [trajs[i] for i in idx[:n_train]]
 
     if target_mode == "waypoint":
+        missing = [t.name for t in train_trajs if not (t / "poses.npy").exists()]
+        if missing:
+            raise FileNotFoundError(
+                f"target_mode='waypoint' needs poses.npy, but {len(missing)} of "
+                f"{len(train_trajs)} train trajectories lack it (e.g. {missing[0]}). "
+                f"That data predates commit 6789b8f — re-convert it with "
+                f"scripts/convert_uzh_fpv.py and re-upload."
+            )
         return np.concatenate(
             [build_waypoint_targets(np.load(t / "poses.npy"), waypoint_horizon)
              for t in train_trajs], axis=0)
