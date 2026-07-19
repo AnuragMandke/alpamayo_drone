@@ -60,10 +60,12 @@ def _load_peft_adapters(model, ckpt_dir):
     set_peft_model_state_dict(model, sd)
 
 
-def load_policy(args, cfg, device):
+def load_policy(args, cfg, device, amp_dtype):
     """Rebuild the arm via the same builders used in training and load the
     trained weights. Returns (model, tokenizer, image_transform_or_None,
-    processor_or_None)."""
+    processor_or_None). `amp_dtype` is the compute dtype the arm was trained in
+    (resolve_amp) — the 4-bit/scratch base must be rebuilt in the SAME dtype, or
+    a T4 eval would default to bf16 and mis-score."""
     mc, tc = cfg["model"], cfg["training"]
     lora = mc["lora"]
 
@@ -88,6 +90,7 @@ def load_policy(args, cfg, device):
         load_in_4bit=mc["load_in_4bit"] and args.init == "pretrained",
         lora_rank=lora["rank"], lora_alpha=lora["alpha"],
         lora_dropout=lora["dropout"],
+        compute_dtype=amp_dtype,
     )
     if args.init == "scratch":
         model = model.to(device)
@@ -102,12 +105,14 @@ def main():
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     from models.action_tokenizer import ActionTokenizer
+    from models.openvla_policy import resolve_amp
     from data.openvla_dataset import (
         OpenVLADroneDataset, PrismaticDroneDataset, compute_drone_norm_stats,
         make_openvla_collate, make_prismatic_collate,
     )
     from eval.openvla_evaluator import evaluate_openvla
 
+    amp_dtype, amp_enabled = resolve_amp(tc)
     target_mode = dc.get("target_mode", "velocity")
     waypoint_horizon = dc.get("waypoint_horizon", 8)
 
@@ -124,7 +129,7 @@ def main():
         print("[Eval] Recomputed drone norm stats from train split")
 
     # ---- Model + tokenizer ---------------------------------------------------
-    model, tokenizer, image_transform, processor = load_policy(args, cfg, device)
+    model, tokenizer, image_transform, processor = load_policy(args, cfg, device, amp_dtype)
     atok = ActionTokenizer(tokenizer)
     pad_id = tokenizer.pad_token_id or 0
 
@@ -151,7 +156,8 @@ def main():
     )
 
     # ---- Evaluate ------------------------------------------------------------
-    metrics = evaluate_openvla(model, loader, atok, stats, device, bf16=tc["bf16"])
+    metrics = evaluate_openvla(model, loader, atok, stats, device,
+                               amp_dtype=amp_dtype, amp_enabled=amp_enabled)
     metrics["init"] = args.init
     metrics["ckpt"] = str(args.ckpt)
 

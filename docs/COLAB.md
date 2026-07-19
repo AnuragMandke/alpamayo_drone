@@ -5,10 +5,14 @@ transfer arm** in 4-bit as a smoke test — enough to prove the model loads and
 trains a few steps without OOM/dtype errors, and to burn down the *pending
 lab-GPU validation* blocker before booking the real GPU.
 
-> **Scope.** This is a ~50-step smoke run in `waypoint` mode. It is **not** a
-> result. The `scratch` and `prismatic` control arms need **>=24 GB bf16** and
-> will not fit a T4 — run the real 3-arm ablation on the lab GPU with
-> `configs/openvla.yaml` (see [OPENVLA.md](OPENVLA.md)).
+> **Scope.** This is a **600-step probe** (~50 min) in `waypoint` mode, plus an
+> offline eval and a **scratch control arm** (see [The scratch control
+> arm](#the-scratch-control-arm-does-pretraining-matter) below). It is **not** a
+> finished result. The `prismatic` gold-standard control needs **>=24 GB bf16** +
+> the `prismatic-vlms` package and stays lab-only; the scratch arm is a full fp16
+> backbone that is *borderline* on a T4 (may OOM — see below). Run the clean,
+> matched-precision 3-arm ablation on the lab GPU with `configs/openvla.yaml`
+> (see [OPENVLA.md](OPENVLA.md)).
 
 There are two ways to run it: the **notebook** (easiest) or the **manual
 commands** below (same steps, if you prefer to paste cells yourself).
@@ -20,7 +24,7 @@ commands** below (same steps, if you prefer to paste cells yourself).
 | Constraint | Consequence |
 |---|---|
 | Turing has **no bf16 tensor cores** | Must train in **fp16**. `configs/openvla_colab.yaml` sets `precision: fp16`; the trainer adds an fp16 GradScaler automatically. |
-| 16 GB VRAM | Only the **4-bit pretrained** arm fits. `scratch`/`prismatic` (24 GB bf16) are lab-GPU only. |
+| 16 GB VRAM | The **4-bit pretrained** arm fits comfortably. The **scratch** arm is a full ~14 GB fp16 backbone (never quantized) — *borderline*, may OOM at batch 1; its clean home is Colab Pro (L4, 24 GB) or the lab GPU. `prismatic` (24 GB bf16 + `prismatic-vlms`) is lab-GPU only. |
 | ~~no `poses.npy`~~ (fixed 2026-07-16) | Re-converted data now ships `poses.npy`, so the smoke runs `target_mode: waypoint`, same as the lab config. **Do not fall back to `velocity`:** it is ill-posed from a single frame (motion is invisible in one image), so every arm converges to the marginal (~2.58 nats) and the ablation returns a null result by construction. |
 | Ephemeral disk, session limits | Weights (~15 GB) re-download every session; the `max_steps: 600` cap keeps the run to ~50 min, short enough to finish in one. |
 
@@ -158,7 +162,59 @@ waypoint 2.482 vs 2.563) — essentially at the marginal, which is all 200 sampl
 The reported loss is **diluted ~2x**: it averages 8 supervised positions, but
 `drone_to_openvla` writes constant zeros into roll/pitch/gripper, so 3 of the 7 action
 tokens plus EOS are free to predict. Only dims `[0,1,2,5]` carry drone data — the
-offline eval should score those 4 alone, or the effect size between arms is halved.
+offline eval scores those 4 alone (below).
+
+## Scoring the probe (offline eval)
+
+The loss is the go/no-go signal; the **offline eval** is the metric the ablation is
+actually compared on. It teacher-forces the val split and reports, for the drone dims
+`[vx, vy, vz, yaw_rate]` only:
+
+- `action_token_accuracy` — top-1 over the 7 action tokens (quantization-free, scale-free)
+- `action_l2` / `per_dim_mae` — decoded error in physical units
+
+It reads the run's own `drone_norm_stats.json` and resolves precision from the config, so it
+runs in **fp16 on a T4** (it used to hardcode bf16 — fixed). Scores are saved to
+`<ckpt>/eval_metrics.json`.
+
+```python
+!python scripts/eval_openvla.py \
+  --config configs/openvla_colab.yaml --init pretrained \
+  --ckpt outputs/openvla/pretrained/epoch001
+```
+
+## The scratch control arm (does pretraining matter?)
+
+Breaking the floor proves the pipeline learns from the camera. It does **not** prove that
+*robot pretraining* is why — a random-init model with the same LoRA could reach the same loss
+purely from finetuning on the drone data. The **scratch** arm settles it, read against the
+same printed floor (2.563):
+
+- **scratch also breaks the floor** → pretraining wasn't necessary; the gain is finetuning.
+- **scratch stalls at ~2.56 while pretrained broke it** → pretraining is doing the work.
+
+**Why a T4-only comparison is still valid** despite the precision mismatch: pretrained runs
+4-bit QLoRA, scratch runs full fp16 (scratch is never quantized). Quantization only *hurts*, so
+full-precision scratch is the **generous** "no-pretraining" arm — if even it stalls while the
+4-bit pretrained arm broke the floor, you can't blame quantization. A conservative win for
+pretraining. The clean, matched-precision version belongs on the lab GPU (`configs/openvla.yaml`,
+bf16 for both).
+
+`configs/openvla_colab_scratch.yaml` runs `batch_size 1 × grad_accum 4` = effective batch 4,
+600 steps = 2400 samples — matching the pretrained probe, so the curves are directly comparable
+(at ~3–4× the wall time; halve `max_steps` to 300 for a faster read). It is **borderline on a
+free T4** and may OOM; on an L4 (24 GB) raise `batch_size` to 4 and `gradient_accumulation_steps`
+to 1.
+
+```python
+!python scripts/train_openvla.py --config configs/openvla_colab_scratch.yaml --init scratch
+!python scripts/eval_openvla.py \
+  --config configs/openvla_colab_scratch.yaml --init scratch \
+  --ckpt outputs/openvla/scratch/epoch001
+```
+
+The 3-arm `scripts/ablate_openvla.py` aggregator wants all three arms for a verdict (it needs
+`prismatic`), so on the T4 just diff the two `eval_metrics.json` on `action_token_accuracy`.
 
 ## Troubleshooting
 

@@ -53,8 +53,13 @@ def _score_tokens(p_ids, g_ids, action_tokenizer, norm_stats):
 
 @torch.no_grad()
 def evaluate_openvla(model, loader, action_tokenizer, norm_stats, device,
-                     bf16=True, n_action_tokens=7):
-    """Teacher-forced offline evaluation over `loader`. Returns a metrics dict."""
+                     amp_dtype=torch.bfloat16, amp_enabled=True, n_action_tokens=7):
+    """Teacher-forced offline evaluation over `loader`. Returns a metrics dict.
+
+    amp_dtype/amp_enabled come from the run's config via resolve_amp: bf16 on the
+    lab GPU, fp16 on a T4 (Turing has NO bf16 tensor cores — casting pixels or
+    autocasting to bf16 there is emulated and can error), fp32 to debug. Must
+    match the dtype the model was built/trained in, or the eval mis-scores."""
     model.eval()
     n_dims = len(DRONE_TO_OPENVLA_IDX)
     tok_correct = tok_total = 0
@@ -63,9 +68,9 @@ def evaluate_openvla(model, loader, action_tokenizer, norm_stats, device,
     n_samples = 0
 
     for batch in loader:
-        batch = _move(batch, device, torch.bfloat16)
-        with torch.autocast("cuda", dtype=torch.bfloat16,
-                            enabled=bf16 and device.type == "cuda"):
+        batch = _move(batch, device, amp_dtype)
+        with torch.autocast("cuda", dtype=amp_dtype,
+                            enabled=amp_enabled and device.type == "cuda"):
             out = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],

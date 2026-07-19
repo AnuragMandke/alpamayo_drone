@@ -41,6 +41,29 @@ LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 PRISMATIC_ID = "prism-dinosiglip-224px+7b"
 
 
+def resolve_amp(tc):
+    """Return (compute_dtype, autocast_enabled) from a training config dict.
+
+    training.precision: "bf16" (default, Ampere+/lab GPU) | "fp16" (Turing/Pascal,
+    e.g. Colab/Kaggle T4 — no bf16 tensor cores) | "fp32". Falls back to the
+    legacy training.bf16 flag when precision is unset.
+
+    Shared by scripts/train_openvla.py and scripts/eval_openvla.py so a run and
+    its eval resolve precision the SAME way — the T4 eval must not silently
+    default to bf16 (no HW support on Turing), which was the pre-fix behaviour.
+    """
+    prec = tc.get("precision")
+    if prec is None:
+        prec = "bf16" if tc.get("bf16", True) else "fp32"
+    if prec == "bf16":
+        return torch.bfloat16, True
+    if prec == "fp16":
+        return torch.float16, True
+    if prec == "fp32":
+        return torch.float32, False
+    raise ValueError(f"training.precision must be bf16|fp16|fp32, got {prec!r}")
+
+
 def _bnb_config(compute_dtype=torch.bfloat16):
     from transformers import BitsAndBytesConfig
     return BitsAndBytesConfig(

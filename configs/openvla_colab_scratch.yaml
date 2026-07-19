@@ -1,0 +1,70 @@
+# OpenVLA SCRATCH control arm on a Colab T4/Colab-Pro L4 — the ablation control
+# that makes the pretrained probe mean something.
+#
+#   python scripts/train_openvla.py --config configs/openvla_colab_scratch.yaml --init scratch
+#
+# WHY THIS ARM. The pretrained probe (configs/openvla_colab.yaml) broke the
+# marginal-loss floor (2.20 vs 2.563 nats), proving the pipeline learns from the
+# camera. It does NOT prove that *robot pretraining* is why: a randomly-initialized
+# model with the same LoRA recipe might reach 2.20 too, purely from finetuning on
+# the drone data. This arm is the control that separates those. Read it against
+# the SAME printed marginal floor (2.563):
+#   - scratch also breaks the floor  -> pretraining wasn't necessary; the gain is
+#     finetuning, not transfer. (Thesis weakened; pipeline still works.)
+#   - scratch stalls at ~2.56 while pretrained broke it -> pretraining is doing
+#     the work. This is the result the thesis wants.
+#
+# WHY A T4-ONLY COMPARISON IS STILL VALID despite the precision mismatch. The
+# pretrained arm runs 4-bit QLoRA; this arm runs FULL fp16 (scratch is never
+# quantized — see openvla_policy.py: load_in_4bit is forced off for non-pretrained).
+# Quantization can only HURT, so full-precision scratch is the *generous* version
+# of "no pretraining." If even the generous scratch stalls at the floor while the
+# 4-bit pretrained arm broke it, you cannot blame scratch's failure on quantization
+# — it is a conservative, clean win for pretraining. The clean-room, matched-
+# precision version still belongs on the lab GPU (configs/openvla.yaml, bf16 both).
+#
+# VRAM REALITY. The scratch base is a ~14 GB fp16 backbone (not 4-bit), so this is
+# BORDERLINE on a free 16 GB T4 even at batch_size 1 + gradient checkpointing. It
+# may OOM. If it does, the arm's real home is Colab Pro (an L4 has 24 GB — raise
+# batch_size to 4 and drop gradient_accumulation_steps to 1) or the lab GPU.
+#
+# COST. batch_size 1 x grad_accum 4 = effective batch 4, matching the pretrained
+# probe, and 600 optimizer steps x 4 = 2400 samples, ALSO matching it — so the two
+# curves are directly comparable. The price is 4 forward/backward passes per step,
+# so expect ~3-4x the pretrained probe's wall time (roughly 2.5-3.5 h). For a
+# faster, rougher read, halve max_steps to 300 (still 1200 samples) — enough to see
+# whether the loss trends toward the floor or below it.
+
+model:
+  load_in_4bit: true          # ignored for --init scratch (forced off in code);
+                              # kept so the file mirrors the pretrained config
+  lora:
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+
+data:
+  dataset_root: "data/uzh_fpv"
+  train_split: 0.9
+  predict_offset: 0
+  num_workers: 2
+  target_mode: waypoint       # MUST match the pretrained probe (well-posed target)
+  waypoint_horizon: 8
+
+training:
+  output_dir: "outputs/openvla"
+  seed: 42                     # same seed as the pretrained probe: same train split,
+                              # and the random base is reproducible for eval
+  precision: fp16             # T4/L4-safe. NOTE: the scratch base is NOT quantized,
+                              # so this is a full ~14GB fp16 backbone (see header).
+  epochs: 1
+  max_steps: 600              # 600 x effective-batch-4 = 2400 samples == pretrained
+  batch_size: 1               # minimize activation memory on a 16GB T4; raise to 4
+                              # on an L4/A100 (and set grad_accum below to 1)
+  gradient_accumulation_steps: 4   # -> effective batch 4, matching the pretrained probe
+  max_grad_norm: 1.0
+  optimizer:
+    lr: 5.0e-4
+    weight_decay: 0.0
+  save_every_n_epochs: 1
+  log_every_n_steps: 20

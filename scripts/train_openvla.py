@@ -43,24 +43,6 @@ def set_seed(s):
     random.seed(s); np.random.seed(s); torch.manual_seed(s); torch.cuda.manual_seed_all(s)
 
 
-def resolve_amp(tc):
-    """Return (compute_dtype, autocast_enabled) from config.
-
-    training.precision: "bf16" (default, Ampere+/lab GPU) | "fp16" (Turing/Pascal,
-    e.g. Colab/Kaggle T4 — no bf16 tensor cores) | "fp32". Falls back to the
-    legacy training.bf16 flag when precision is unset."""
-    prec = tc.get("precision")
-    if prec is None:
-        prec = "bf16" if tc.get("bf16", True) else "fp32"
-    if prec == "bf16":
-        return torch.bfloat16, True
-    if prec == "fp16":
-        return torch.float16, True
-    if prec == "fp32":
-        return torch.float32, False
-    raise ValueError(f"training.precision must be bf16|fp16|fp32, got {prec!r}")
-
-
 def move_batch(batch, device, pixel_dtype):
     """Move a batch to device; cast pixel_values to pixel_dtype. pixel_values is a
     tensor (OpenVLA) or a dict of tensors (Prismatic dinosiglip)."""
@@ -80,17 +62,19 @@ def main():
     mc, dc, tc = cfg["model"], cfg["data"], cfg["training"]
     set_seed(tc["seed"])
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    amp_dtype, amp_enabled = resolve_amp(tc)
-    print(f"[Train] precision={amp_dtype} (autocast={'on' if amp_enabled else 'off'})")
 
     from models.openvla_policy import (
         build_openvla_policy, build_prismatic_policy, trainable_parameters,
+        resolve_amp,
     )
     from models.action_tokenizer import ActionTokenizer
     from data.openvla_dataset import (
         OpenVLADroneDataset, PrismaticDroneDataset, compute_drone_norm_stats,
         make_openvla_collate, make_prismatic_collate, marginal_loss_floor,
     )
+
+    amp_dtype, amp_enabled = resolve_amp(tc)
+    print(f"[Train] precision={amp_dtype} (autocast={'on' if amp_enabled else 'off'})")
 
     is_prismatic = args.init == "prismatic"
 
