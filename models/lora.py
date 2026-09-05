@@ -6,7 +6,7 @@ while keeping all base weights frozen.
 """
 
 import math
-from typing import List
+from typing import List, Union
 import torch
 import torch.nn as nn
 
@@ -70,7 +70,7 @@ class LoRALinear(nn.Module):
 
 def inject_lora(
     model: nn.Module,
-    target_modules: List[str],
+    target_modules: Union[List[str], str],
     rank: int,
     alpha: float,
     dropout: float = 0.0,
@@ -79,8 +79,19 @@ def inject_lora(
     Walk the model, replace every Linear whose name ends with one of
     `target_modules` with a LoRALinear.
 
+    `target_modules` is either a list of name suffixes (e.g. ["q_proj", ...]) or
+    the string "all-linear" — every Linear except the LM head, mirroring PEFT's
+    sentinel so the hand-rolled (Prismatic) and PEFT (OpenVLA) arms take the same
+    recipe from one config value.
+
     Freezes ALL base parameters first, then marks LoRA params as trainable.
     """
+    all_linear = isinstance(target_modules, str) and target_modules == "all-linear"
+    if isinstance(target_modules, str) and not all_linear:
+        raise ValueError(
+            f"target_modules string must be 'all-linear', got {target_modules!r}; "
+            "pass a list of name suffixes otherwise")
+
     # Step 1: freeze everything
     for param in model.parameters():
         param.requires_grad_(False)
@@ -90,7 +101,12 @@ def inject_lora(
     for name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
             continue
-        if not any(name.endswith(t) for t in target_modules):
+        if all_linear:
+            # Skip the tied output projection, as PEFT's all-linear does — LoRA on
+            # the LM head is both unusual and can destabilize the vocab logits.
+            if name.split(".")[-1] == "lm_head":
+                continue
+        elif not any(name.endswith(t) for t in target_modules):
             continue
 
         lora_layer = LoRALinear(module, rank=rank, alpha=alpha, dropout=dropout)

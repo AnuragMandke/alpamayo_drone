@@ -72,7 +72,7 @@ def main():
           f"input_ids {tuple(s['input_ids'].shape)}")
 
     # Decode the supervised action tokens -> should recover the stored action
-    traj, t = ds.samples[0]
+    traj, t, _t_tgt = ds.samples[0]   # (traj, frame, target_frame); velocity target_frame=None
     raw = np.load(traj / "actions.npy")[t]
     action_token_ids = s["labels"][-8:-1].numpy()
     recon_norm7 = atok.decode_token_ids_to_actions(action_token_ids)

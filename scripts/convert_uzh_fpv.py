@@ -14,11 +14,18 @@ Output (per chunk):
             images/          # rgb_000.png ... (224x224 RGB)
             actions.npy      # (T, 4) float32  [vx, vy, vz, yaw_rate]
             poses.npy        # (T, 7) float32  world [x,y,z,qx,qy,qz,qw] per frame
+            timestamps.npy   # (T,)   float64  per-frame time (s), GT clock
             instructions.txt # one natural-language goal per line
 
 poses.npy lets the OpenVLA pipeline derive body-frame displacement-waypoint
 targets (data.openvla_dataset, target_mode="waypoint") as a well-posed
 alternative to instantaneous velocity; Pipeline B ignores it.
+
+timestamps.npy carries each saved frame's time on the groundtruth clock. UZH-FPV
+drops frames, so a fixed FRAME horizon is a VARIABLE time horizon; with these
+timestamps the dataset can instead target a fixed TIME lookahead
+(waypoint_horizon_seconds), removing that irreducible target-noise source. It is
+purely additive — velocity/frame-horizon paths ignore it.
 
 Note: chunk names follow {sequence_name}_t{i:03d}; the directory gets a
 "traj_" prefix because AirSimDroneDataset discovers trajectories via the
@@ -357,6 +364,9 @@ def convert_sequence(seq_dir: Path, dst_root: Path, chunk_size: int,
         chunk_poses = np.concatenate(
             [positions[gt_idx[start:end]], quats[gt_idx[start:end]]], axis=1
         ).astype(np.float32)
+        # Per-frame time on the GT clock (img_ts was rescaled to it above), so the
+        # dataset can build a fixed-TIME waypoint instead of a fixed-frame one.
+        chunk_ts = img_ts[start:end].astype(np.float64)
         traj_dir = dst_root / f"traj_{chunk_name}"
 
         if dry_run:
@@ -384,6 +394,7 @@ def convert_sequence(seq_dir: Path, dst_root: Path, chunk_size: int,
 
             np.save(traj_dir / "actions.npy", chunk_actions)
             np.save(traj_dir / "poses.npy", chunk_poses)
+            np.save(traj_dir / "timestamps.npy", chunk_ts)
             (traj_dir / "instructions.txt").write_text(
                 "\n".join(instructions), encoding="utf-8"
             )

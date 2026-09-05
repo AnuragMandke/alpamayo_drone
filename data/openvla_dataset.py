@@ -50,14 +50,70 @@ PROMPT = "In: What action should the robot take to {instruction}?\nOut:"
 #               more directly. Requires poses.npy (re-run convert_uzh_fpv.py).
 # ----------------------------------------------------------------------------
 
-def build_waypoint_targets(poses: np.ndarray, horizon: int) -> np.ndarray:
+def _body_frame_delta(poses: np.ndarray, t: int, t_tgt: int) -> np.ndarray:
+    """Body-frame [dx, dy, dz, dyaw] from frame t to an arbitrary target frame
+    t_tgt: the displacement expressed in the body frame at t, plus the net heading
+    change. Shared by the fixed-frame and fixed-time waypoint paths."""
+    from scipy.spatial.transform import Rotation
+    rot = Rotation.from_quat(poses[[t, t_tgt], 3:7])   # R_t, R_{t_tgt}
+    out = np.zeros(4, dtype=np.float32)
+    out[:3] = rot[0].inv().apply(poses[t_tgt, :3] - poses[t, :3])
+    out[3] = (rot[0].inv() * rot[1]).as_euler("zyx")[0]
+    return out
+
+
+def waypoint_target_index(timestamps: np.ndarray, t: int,
+                          horizon_seconds: float):
+    """Index of the frame nearest to `timestamps[t] + horizon_seconds`, searched
+    forward. Returns None when the target time runs past the trajectory (no valid
+    lookahead) or the nearest frame is not strictly ahead of t.
+
+    This is the fix for the variable-time-horizon problem: UZH-FPV drops frames,
+    so a fixed FRAME offset spans a variable amount of TIME (worst 8-frame window
+    0.43s vs 0.27s nominal). Anchoring on a fixed time removes that target noise."""
+    t_target = timestamps[t] + horizon_seconds
+    if t_target > timestamps[-1]:
+        return None
+    j = int(np.searchsorted(timestamps, t_target))
+    if j >= len(timestamps):
+        j = len(timestamps) - 1
+    # searchsorted lands on the first frame >= t_target; the previous frame may be
+    # closer. Pick whichever timestamp is nearer the requested time.
+    if j > 0 and abs(timestamps[j - 1] - t_target) <= abs(timestamps[j] - t_target):
+        j -= 1
+    return j if j > t else None
+
+
+def waypoint_pairs(timestamps: np.ndarray, horizon_seconds: float):
+    """[(t, t_tgt), ...] for every frame with a valid fixed-time lookahead."""
+    pairs = []
+    for t in range(len(timestamps)):
+        j = waypoint_target_index(timestamps, t, horizon_seconds)
+        if j is not None:
+            pairs.append((t, j))
+    return pairs
+
+
+def build_waypoint_targets(poses: np.ndarray, horizon: int,
+                           timestamps: np.ndarray = None,
+                           horizon_seconds: float = None) -> np.ndarray:
     """
     poses: (T, 7) world-frame [x, y, z, qx, qy, qz, qw].
-    Returns (T - horizon, 4) body-frame [dx, dy, dz, dyaw]: the displacement to
-    the pose `horizon` steps ahead expressed in the body frame at t, plus the net
-    heading change. No dt (displacement, not a rate) — so it's free of the
-    finite-difference noise that plagues velocity targets.
+    Returns (N, 4) body-frame [dx, dy, dz, dyaw]. No dt (displacement, not a rate)
+    — so it's free of the finite-difference noise that plagues velocity targets.
+
+    Fixed-frame (default): target the pose `horizon` steps ahead -> N = T - horizon.
+    Fixed-time (timestamps + horizon_seconds given): target the pose nearest
+    `horizon_seconds` ahead on the clock -> N = number of frames with a valid
+    lookahead. Removes the variable-time-horizon target noise (see
+    waypoint_target_index).
     """
+    if horizon_seconds is not None:
+        pairs = waypoint_pairs(timestamps, horizon_seconds)
+        if not pairs:
+            return np.zeros((0, 4), dtype=np.float32)
+        return np.stack([_body_frame_delta(poses, t, j) for t, j in pairs])
+
     from scipy.spatial.transform import Rotation
     pos = poses[:, :3]
     rot = Rotation.from_quat(poses[:, 3:7])
@@ -71,18 +127,16 @@ def build_waypoint_targets(poses: np.ndarray, horizon: int) -> np.ndarray:
 
 
 def _single_waypoint(poses: np.ndarray, t: int, horizon: int) -> np.ndarray:
-    """Body-frame [dx, dy, dz, dyaw] for one frame t (cheap; avoids rebuilding
-    the whole trajectory's targets on every __getitem__)."""
-    from scipy.spatial.transform import Rotation
-    rot = Rotation.from_quat(poses[[t, t + horizon], 3:7])   # R_t, R_{t+h}
-    out = np.zeros(4, dtype=np.float32)
-    out[:3] = rot[0].inv().apply(poses[t + horizon, :3] - poses[t, :3])
-    out[3] = (rot[0].inv() * rot[1]).as_euler("zyx")[0]
-    return out
+    """Body-frame [dx, dy, dz, dyaw] for one frame t at a fixed FRAME horizon
+    (cheap; avoids rebuilding the whole trajectory's targets on every
+    __getitem__). The fixed-TIME path passes an explicit target index to
+    _body_frame_delta instead."""
+    return _body_frame_delta(poses, t, t + horizon)
 
 
 def _train_targets(root: str, train_split: float, seed: int,
-                   target_mode: str, waypoint_horizon: int) -> np.ndarray:
+                   target_mode: str, waypoint_horizon: int,
+                   waypoint_horizon_seconds: float = None) -> np.ndarray:
     """(N, 4) raw targets over the TRAIN trajectories. Shared by the norm stats
     and the marginal-loss floor so both see exactly the same split."""
     root = Path(root)
@@ -114,6 +168,22 @@ def _train_targets(root: str, train_split: float, seed: int,
                 f"That data predates commit 6789b8f — re-convert it with "
                 f"scripts/convert_uzh_fpv.py and re-upload."
             )
+        if waypoint_horizon_seconds is not None:
+            ts_missing = [t.name for t in train_trajs
+                          if not (t / "timestamps.npy").exists()]
+            if ts_missing:
+                raise FileNotFoundError(
+                    f"waypoint_horizon_seconds needs timestamps.npy, but "
+                    f"{len(ts_missing)} of {len(train_trajs)} train trajectories "
+                    f"lack it (e.g. {ts_missing[0]}). Re-convert with "
+                    f"scripts/convert_uzh_fpv.py (it now emits per-frame "
+                    f"timestamps) and re-upload the tarball."
+                )
+            return np.concatenate(
+                [build_waypoint_targets(
+                    np.load(t / "poses.npy"), waypoint_horizon,
+                    np.load(t / "timestamps.npy"), waypoint_horizon_seconds)
+                 for t in train_trajs], axis=0)
         return np.concatenate(
             [build_waypoint_targets(np.load(t / "poses.npy"), waypoint_horizon)
              for t in train_trajs], axis=0)
@@ -122,7 +192,8 @@ def _train_targets(root: str, train_split: float, seed: int,
 
 def marginal_loss_floor(root: str, stats: dict, train_split: float = 0.9,
                         seed: int = 42, target_mode: str = "velocity",
-                        waypoint_horizon: int = 8, bins: int = 256):
+                        waypoint_horizon: int = 8, bins: int = 256,
+                        waypoint_horizon_seconds: float = None):
     """
     The mean CE a model scores by predicting the MARGINAL action distribution and
     ignoring the image entirely. This is the yardstick for reading a training
@@ -141,7 +212,8 @@ def marginal_loss_floor(root: str, stats: dict, train_split: float = 0.9,
 
     Returns (floor_nats, per_dim_entropies).
     """
-    targets = _train_targets(root, train_split, seed, target_mode, waypoint_horizon)
+    targets = _train_targets(root, train_split, seed, target_mode,
+                             waypoint_horizon, waypoint_horizon_seconds)
     norm = normalize_action(targets, stats)
     edges = np.linspace(-1.0, 1.0, bins)          # mirrors ActionTokenizer.bins
     H = []
@@ -154,13 +226,15 @@ def marginal_loss_floor(root: str, stats: dict, train_split: float = 0.9,
 
 def compute_drone_norm_stats(root: str, train_split: float = 0.9,
                              seed: int = 42, target_mode: str = "velocity",
-                             waypoint_horizon: int = 8) -> dict:
+                             waypoint_horizon: int = 8,
+                             waypoint_horizon_seconds: float = None) -> dict:
     """
     Per-dim [1%, 99%] quantiles + min/max over the TRAIN trajectories' targets.
     Mirrors OpenVLA's dataset_statistics so targets normalize to ~[-1, 1].
     `target_mode` selects velocity (actions.npy) vs waypoint (poses.npy).
     """
-    actions = _train_targets(root, train_split, seed, target_mode, waypoint_horizon)
+    actions = _train_targets(root, train_split, seed, target_mode,
+                             waypoint_horizon, waypoint_horizon_seconds)
     return {
         "q01": np.quantile(actions, 0.01, axis=0).tolist(),
         "q99": np.quantile(actions, 0.99, axis=0).tolist(),
@@ -194,7 +268,8 @@ class OpenVLADroneDataset(Dataset):
     def __init__(self, root, processor, action_tokenizer: ActionTokenizer,
                  norm_stats: dict, split: str = "train", train_split: float = 0.9,
                  seed: int = 42, predict_offset: int = 0,
-                 target_mode: str = "velocity", waypoint_horizon: int = 8):
+                 target_mode: str = "velocity", waypoint_horizon: int = 8,
+                 waypoint_horizon_seconds: float = None):
         self.root = Path(root)
         self.processor = processor
         self.action_tokenizer = action_tokenizer
@@ -202,6 +277,10 @@ class OpenVLADroneDataset(Dataset):
         self.predict_offset = predict_offset   # action at t+offset for frame t
         self.target_mode = target_mode
         self.waypoint_horizon = waypoint_horizon
+        # Fixed-TIME waypoint lookahead (seconds). When set, the target is the pose
+        # nearest this many seconds ahead on the GT clock instead of a fixed frame
+        # count — needs timestamps.npy. None keeps the fixed-frame behaviour.
+        self.waypoint_horizon_seconds = waypoint_horizon_seconds
 
         trajs = sorted((self.root / "trajectories").glob("traj_*"))
         if not trajs:
@@ -212,8 +291,10 @@ class OpenVLADroneDataset(Dataset):
         sel = idx[:n_train] if split == "train" else idx[n_train:]
         selected = [trajs[i] for i in sel]
 
-        # Flat index of (traj, frame_t). Valid frames depend on the target: a
-        # waypoint needs the pose `horizon` ahead; a velocity needs t+offset.
+        # Flat index of (traj, frame_t, t_tgt). t_tgt is the waypoint target frame
+        # (None for velocity). Fixed-frame: t_tgt = t + horizon. Fixed-time: the
+        # frame nearest `horizon_seconds` ahead, so dropped frames don't distort
+        # the lookahead. A velocity target just needs t+offset.
         self.samples = []
         for traj in selected:
             if target_mode == "waypoint":
@@ -223,29 +304,44 @@ class OpenVLADroneDataset(Dataset):
                         f"target_mode='waypoint' needs {poses_file}, which is "
                         "missing. Re-run scripts/convert_uzh_fpv.py to emit "
                         "poses.npy alongside actions.npy.")
-                usable = len(np.load(poses_file)) - waypoint_horizon
+                if waypoint_horizon_seconds is not None:
+                    ts_file = traj / "timestamps.npy"
+                    if not ts_file.is_file():
+                        raise FileNotFoundError(
+                            f"waypoint_horizon_seconds needs {ts_file}, which is "
+                            "missing. Re-run scripts/convert_uzh_fpv.py (it now "
+                            "emits per-frame timestamps) and re-upload.")
+                    ts = np.load(ts_file)
+                    for t, t_tgt in waypoint_pairs(ts, waypoint_horizon_seconds):
+                        self.samples.append((traj, t, t_tgt))
+                else:
+                    usable = len(np.load(poses_file)) - waypoint_horizon
+                    for t in range(usable):
+                        self.samples.append((traj, t, t + waypoint_horizon))
             else:
                 usable = len(np.load(traj / "actions.npy")) - predict_offset
-            for t in range(usable):
-                self.samples.append((traj, t))
+                for t in range(usable):
+                    self.samples.append((traj, t, None))
+        mode = (f"waypoint@{waypoint_horizon_seconds}s"
+                if target_mode == "waypoint" and waypoint_horizon_seconds is not None
+                else target_mode)
         print(f"[OpenVLA-Dataset] {split}: {len(self.samples)} samples "
-              f"from {len(selected)} trajectories (target={target_mode})")
+              f"from {len(selected)} trajectories (target={mode})")
 
         self.eos_token_id = processor.tokenizer.eos_token_id
 
     def __len__(self):
         return len(self.samples)
 
-    def _raw_target(self, traj, t):
+    def _raw_target(self, traj, t, t_tgt):
         """The raw 4-DoF target for frame t (velocity or waypoint), pre-norm."""
         if self.target_mode == "waypoint":
-            return _single_waypoint(np.load(traj / "poses.npy"), t,
-                                    self.waypoint_horizon)
+            return _body_frame_delta(np.load(traj / "poses.npy"), t, t_tgt)
         return np.load(traj / "actions.npy")[t + self.predict_offset]
 
     def _load_inputs(self, i):
         """Processor-agnostic part: (PIL image, prompt str, action tokens (7,))."""
-        traj, t = self.samples[i]
+        traj, t, t_tgt = self.samples[i]
         img_files = sorted((traj / "images").glob("rgb_*.png"))
         image = Image.open(img_files[t]).convert("RGB")
 
@@ -253,7 +349,7 @@ class OpenVLADroneDataset(Dataset):
         instruction = random.choice(instrs) if instrs else "navigate to the goal"
         prompt = PROMPT.format(instruction=instruction)
 
-        action = self._raw_target(traj, t)                               # (4,)
+        action = self._raw_target(traj, t, t_tgt)                        # (4,)
         norm = normalize_action(action, self.norm_stats)                 # (4,) in [-1,1]
         action7 = drone_to_openvla(norm)                                 # (7,)
         action_tokens = self.action_tokenizer(action7).astype(np.int64)  # (7,)
@@ -300,11 +396,13 @@ class PrismaticDroneDataset(OpenVLADroneDataset):
     def __init__(self, root, tokenizer, image_transform, action_tokenizer,
                  norm_stats, split: str = "train", train_split: float = 0.9,
                  seed: int = 42, predict_offset: int = 0,
-                 target_mode: str = "velocity", waypoint_horizon: int = 8):
+                 target_mode: str = "velocity", waypoint_horizon: int = 8,
+                 waypoint_horizon_seconds: float = None):
         super().__init__(root, _TokenizerOnly(tokenizer), action_tokenizer,
                          norm_stats, split=split, train_split=train_split,
                          seed=seed, predict_offset=predict_offset,
-                         target_mode=target_mode, waypoint_horizon=waypoint_horizon)
+                         target_mode=target_mode, waypoint_horizon=waypoint_horizon,
+                         waypoint_horizon_seconds=waypoint_horizon_seconds)
         self.tokenizer = tokenizer
         self.image_transform = image_transform
 

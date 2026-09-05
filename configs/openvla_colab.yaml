@@ -39,6 +39,12 @@ model:
     rank: 32
     alpha: 64
     dropout: 0.0
+    # all-linear (attention + MLP) is OpenVLA's recipe and the default; it raises
+    # trainable params ~33.5M -> ~110M, which adds ~1-2GB of optimizer state on
+    # top of the 4-bit base. If the T4 OOMs, drop batch_size to 2, or set this to
+    # [q_proj, k_proj, v_proj, o_proj] to reproduce the attention-only probe
+    # (the 2.201-nats run was attention-only — a matched re-run needs this list).
+    targets: all-linear
 
 data:
   dataset_root: "data/uzh_fpv"

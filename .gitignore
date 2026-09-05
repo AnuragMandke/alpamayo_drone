@@ -10,6 +10,9 @@ data/raw/
 data/uzh_fpv/
 data/tiny_backbone/
 
+# Data tarballs staged for Colab/Drive upload (regenerable: tar czf ... -C data uzh_fpv)
+*.tar.gz
+
 # Training outputs
 outputs/
 wandb/

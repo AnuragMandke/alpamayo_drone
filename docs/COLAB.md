@@ -154,7 +154,7 @@ answer one question: **does the loss break below it?**
 | Outcome | Meaning |
 |---|---|
 | Breaks below (~2.3 or lower) | The model is using the camera. Book the lab GPU. |
-| Stalls at ~2.56 | It learned the action prior and nothing about what it sees. Prime suspect: `LORA_TARGETS` is attention-only (q/k/v/o_proj) where OpenVLA's official recipe uses `all-linear` incl. MLP. |
+| Stalls at ~2.56 | It learned the action prior and nothing about what it sees. The old prime suspect — attention-only LoRA — is now **fixed**: the configs default to `model.lora.targets: all-linear` (attention + MLP), OpenVLA's recipe. To A/B it, set `targets: [q_proj, k_proj, v_proj, o_proj]`. Note the 2.201-nats probe was attention-only, so a matched re-run needs that list. |
 
 Both 50-step runs landed ~0.1 nats below their floor (velocity 2.450 vs 2.576;
 waypoint 2.482 vs 2.563) — essentially at the marginal, which is all 200 samples buys.
@@ -231,6 +231,8 @@ The 3-arm `scripts/ablate_openvla.py` aggregator wants all three arms for a verd
 | Key | Smoke value | Notes |
 |---|---|---|
 | `training.precision` | `fp16` | **T4-mandatory.** `bf16` on the lab GPU, `fp32` to debug. |
-| `training.max_steps` | `50` | Optimizer-step cap; remove for a full epoch. |
+| `training.max_steps` | `600` | Optimizer-step cap; remove for a full epoch. |
 | `training.batch_size` | `4` | Raise on bigger VRAM, lower on OOM. |
 | `data.target_mode` | `waypoint` | Leave it. `velocity` is ill-posed from one frame — see the constraints table. |
+| `model.lora.targets` | `all-linear` | Attention + MLP (OpenVLA's recipe). ~33.5M → ~110M trainable, so ~1–2 GB more; drop `batch_size` if it OOMs, or set `[q_proj, k_proj, v_proj, o_proj]` for the attention-only A/B. |
+| `data.waypoint_horizon_seconds` | *(unset)* | Set (e.g. `0.27`) for a fixed-**time** waypoint that corrects UZH-FPV's dropped frames. Needs the re-converted data with `timestamps.npy` (re-tar + re-upload). Unset = fixed 8-frame horizon. |

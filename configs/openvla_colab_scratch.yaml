@@ -42,6 +42,10 @@ model:
     rank: 32
     alpha: 64
     dropout: 0.0
+    targets: all-linear       # MUST match the pretrained probe's targets so the
+                              # two arms differ only in init, not LoRA footprint.
+                              # On a full fp16 scratch base this pushes VRAM up —
+                              # if it OOMs, match the pretrained config's choice.
 
 data:
   dataset_root: "data/uzh_fpv"
