@@ -21,7 +21,15 @@ pip install -r requirements-openvla.txt
 ```
 
 Hardware: **>=16 GB GPU** for the 4-bit pretrained arm, **>=24 GB** for the
-from-scratch arm (full fine-tune, bf16). The 6 GB dev laptop cannot train this.
+from-scratch arm (random-init + LoRA, but a full bf16 backbone — never quantized).
+The 6 GB dev laptop cannot train this.
+
+On a single 24 GB card the arms cannot share one batch shape, so
+`training.per_arm` in `configs/openvla.yaml` gives each its own
+`batch_size`/`gradient_accumulation_steps` while holding the **effective batch at
+16** for all three (the trainer refuses an override that changes the product — an
+unmatched effective batch would confound the comparison). Step-by-step procedure:
+**`docs/LAB_GPU.md`**.
 
 ## Data
 
@@ -65,7 +73,7 @@ velocity-only datasets must be reconverted.
 # Transfer arm: robot-pretrained OpenVLA + LoRA
 python scripts/train_openvla.py --config configs/openvla.yaml --init pretrained
 
-# Control arm: same architecture, random init, full fine-tune
+# Control arm: same architecture, random init + LoRA (base frozen, not quantized)
 python scripts/train_openvla.py --config configs/openvla.yaml --init scratch
 ```
 

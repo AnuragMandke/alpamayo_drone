@@ -68,13 +68,16 @@ def load_policy(args, cfg, device, amp_dtype):
     a T4 eval would default to bf16 and mis-score."""
     mc, tc = cfg["model"], cfg["training"]
     lora = mc["lora"]
+    # Must match training: adapter keys depend on which modules got LoRA, so a
+    # mismatch here makes set_peft_model_state_dict / load_lora_weights miss.
+    lora_targets = lora.get("targets", "all-linear")
 
     if args.init == "prismatic":
         from models.openvla_policy import build_prismatic_policy
         from models.lora import load_lora_weights
         model, tokenizer, image_transform = build_prismatic_policy(
             lora_rank=lora["rank"], lora_alpha=lora["alpha"],
-            lora_dropout=lora["dropout"],
+            lora_dropout=lora["dropout"], lora_targets=lora_targets,
         )
         load_lora_weights(model, str(Path(args.ckpt) / "lora_weights.pt"))
         model = model.to(device)
@@ -89,7 +92,7 @@ def load_policy(args, cfg, device, amp_dtype):
         init=args.init,
         load_in_4bit=mc["load_in_4bit"] and args.init == "pretrained",
         lora_rank=lora["rank"], lora_alpha=lora["alpha"],
-        lora_dropout=lora["dropout"],
+        lora_dropout=lora["dropout"], lora_targets=lora_targets,
         compute_dtype=amp_dtype,
     )
     if args.init == "scratch":
@@ -105,16 +108,21 @@ def main():
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     from models.action_tokenizer import ActionTokenizer
-    from models.openvla_policy import resolve_amp
+    from models.openvla_policy import resolve_amp, resolve_arm_training_cfg
     from data.openvla_dataset import (
         OpenVLADroneDataset, PrismaticDroneDataset, compute_drone_norm_stats,
         make_openvla_collate, make_prismatic_collate,
     )
     from eval.openvla_evaluator import evaluate_openvla
 
+    # Same per-arm loader shape as training, so a bf16 arm evaluated on the same
+    # card does not OOM at the 4-bit arm's batch_size.
+    tc = resolve_arm_training_cfg(tc, args.init)
+    cfg["training"] = tc
     amp_dtype, amp_enabled = resolve_amp(tc)
     target_mode = dc.get("target_mode", "velocity")
     waypoint_horizon = dc.get("waypoint_horizon", 8)
+    waypoint_horizon_seconds = dc.get("waypoint_horizon_seconds")
 
     # ---- Drone normalization stats: prefer the ones saved with the run -------
     stats_path = Path(args.ckpt).parent / "drone_norm_stats.json"
@@ -125,6 +133,7 @@ def main():
         stats = compute_drone_norm_stats(
             dc["dataset_root"], dc["train_split"], tc["seed"],
             target_mode=target_mode, waypoint_horizon=waypoint_horizon,
+            waypoint_horizon_seconds=waypoint_horizon_seconds,
         )
         print("[Eval] Recomputed drone norm stats from train split")
 
@@ -140,6 +149,7 @@ def main():
             split="val", train_split=dc["train_split"], seed=tc["seed"],
             predict_offset=dc["predict_offset"],
             target_mode=target_mode, waypoint_horizon=waypoint_horizon,
+            waypoint_horizon_seconds=waypoint_horizon_seconds,
         )
         collate = make_prismatic_collate(pad_id)
     else:
@@ -148,6 +158,7 @@ def main():
             train_split=dc["train_split"], seed=tc["seed"],
             predict_offset=dc["predict_offset"],
             target_mode=target_mode, waypoint_horizon=waypoint_horizon,
+            waypoint_horizon_seconds=waypoint_horizon_seconds,
         )
         collate = make_openvla_collate(pad_id)
     loader = DataLoader(

@@ -32,7 +32,17 @@ import torch
 import torch.nn as nn
 
 OPENVLA_ID = "openvla/openvla-7b"
-LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+# LoRA target modules. OpenVLA's official finetuning recipe applies LoRA to ALL
+# linear layers (attention q/k/v/o PLUS the MLP up/gate/down projections), not
+# attention-only — attention-only starves the transfer arm of capacity and is the
+# prime suspect if a run stalls at the marginal-loss floor. "all-linear" is PEFT's
+# sentinel for "every Linear except the LM head"; the hand-rolled inject_lora
+# (Prismatic arm) understands it too (see models/lora.py). Pass a list to pin a
+# subset — e.g. ATTENTION_LORA_TARGETS — so the ablation can sweep this dimension
+# from config without code edits.
+DEFAULT_LORA_TARGETS = "all-linear"
+ATTENTION_LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]  # legacy subset
 
 # Prismatic VLM base: same DINOv2+SigLIP vision + Llama-2-7B as OpenVLA, with the
 # SAME vision-language pretraining, but NEVER robot/action-trained — the clean
@@ -64,6 +74,47 @@ def resolve_amp(tc):
     raise ValueError(f"training.precision must be bf16|fp16|fp32, got {prec!r}")
 
 
+def resolve_arm_training_cfg(tc, init):
+    """Return the training config with `training.per_arm.<init>` applied.
+
+    A 24GB card cannot hold the 4-bit `pretrained` arm and the bf16
+    `scratch`/`prismatic` arms at the same batch_size, so the arms need
+    different per-step batches. But the ablation is only clean if every arm
+    takes its optimizer steps over the SAME number of samples — so a per-arm
+    override may only shift work between batch_size and
+    gradient_accumulation_steps, never change their product. A mismatch is
+    rejected rather than warned about: it silently confounds every cross-arm
+    number, and the whole point of the three arms is that they differ ONLY in
+    backbone init.
+
+    Shared by scripts/train_openvla.py and scripts/eval_openvla.py so a run and
+    its eval size their loaders the same way.
+    """
+    per_arm = (tc.get("per_arm") or {}).get(init)
+    if not per_arm:
+        return tc
+    extra = set(per_arm) - {"batch_size", "gradient_accumulation_steps"}
+    if extra:
+        raise ValueError(
+            f"training.per_arm.{init} may only override batch_size and "
+            f"gradient_accumulation_steps (memory shape); got {sorted(extra)}. "
+            f"Anything else would make the arms differ by more than their init."
+        )
+    out = {k: v for k, v in tc.items() if k != "per_arm"}
+    out.update(per_arm)
+    base = tc["batch_size"] * tc["gradient_accumulation_steps"]
+    got = out["batch_size"] * out["gradient_accumulation_steps"]
+    if got != base:
+        raise ValueError(
+            f"training.per_arm.{init} changes the effective batch "
+            f"({out['batch_size']}x{out['gradient_accumulation_steps']}={got}) "
+            f"away from the config default ({tc['batch_size']}x"
+            f"{tc['gradient_accumulation_steps']}={base}). Keep the product "
+            f"equal across arms or the comparison is confounded."
+        )
+    return out
+
+
 def _bnb_config(compute_dtype=torch.bfloat16):
     from transformers import BitsAndBytesConfig
     return BitsAndBytesConfig(
@@ -80,6 +131,7 @@ def build_openvla_policy(
     lora_rank: int = 32,
     lora_alpha: int = 64,
     lora_dropout: float = 0.0,
+    lora_targets=DEFAULT_LORA_TARGETS,  # "all-linear" (recipe) or a list of names
     compute_dtype=torch.bfloat16,      # torch.float16 on Turing (T4): no bf16 HW
 ):
     """
@@ -112,8 +164,9 @@ def build_openvla_policy(
             low_cpu_mem_usage=True,
             trust_remote_code=True,
         )
-        model = _apply_lora(model, lora_rank, lora_alpha, lora_dropout, quantized=bnb is not None)
-        print(f"[OpenVLA] pretrained + LoRA(r={lora_rank}) — transfer arm")
+        model = _apply_lora(model, lora_rank, lora_alpha, lora_dropout,
+                            lora_targets, quantized=bnb is not None)
+        print(f"[OpenVLA] pretrained + LoRA(r={lora_rank}, targets={lora_targets}) — transfer arm")
 
     elif init == "scratch":
         # Same architecture and SAME LoRA setup as the transfer arm, but weights
@@ -126,8 +179,9 @@ def build_openvla_policy(
         config = AutoConfig.from_pretrained(OPENVLA_ID, trust_remote_code=True)
         model = AutoModelForVision2Seq.from_config(config, trust_remote_code=True)
         model = model.to(compute_dtype)
-        model = _apply_lora(model, lora_rank, lora_alpha, lora_dropout, quantized=False)
-        print(f"[OpenVLA] random init + LoRA(r={lora_rank}) — from-scratch control arm")
+        model = _apply_lora(model, lora_rank, lora_alpha, lora_dropout,
+                            lora_targets, quantized=False)
+        print(f"[OpenVLA] random init + LoRA(r={lora_rank}, targets={lora_targets}) — from-scratch control arm")
 
     else:
         raise ValueError(f"init must be 'pretrained' or 'scratch', got {init!r}")
@@ -139,6 +193,7 @@ def build_prismatic_policy(
     lora_rank: int = 32,
     lora_alpha: int = 64,
     lora_dropout: float = 0.0,
+    lora_targets=DEFAULT_LORA_TARGETS,
 ):
     """
     Control arm: the Prismatic VLM base `prism-dinosiglip-224px+7b` — vision-
@@ -171,9 +226,13 @@ def build_prismatic_policy(
     # first freeze the vision backbone + projector (separate submodules) too.
     for p in vlm.parameters():
         p.requires_grad_(False)
+    # NOTE: this LoRAs the LLM linears only (the vision backbone + projector are
+    # frozen submodules). PEFT's "all-linear" on the OpenVLA/scratch arms targets
+    # linears across the whole VLA, so verify the two arms' LoRA footprints match
+    # closely enough on the lab GPU before reading the pretrained-vs-Prismatic gap.
     inject_lora(
         vlm.llm_backbone.llm,
-        target_modules=LORA_TARGETS,
+        target_modules=lora_targets,
         rank=lora_rank, alpha=lora_alpha, dropout=lora_dropout,
     )
 
@@ -196,7 +255,7 @@ def build_prismatic_policy(
     return vlm, tokenizer, image_transform
 
 
-def _apply_lora(model, rank, alpha, dropout, quantized):
+def _apply_lora(model, rank, alpha, dropout, lora_targets, quantized):
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
     if quantized:
@@ -216,7 +275,10 @@ def _apply_lora(model, rank, alpha, dropout, quantized):
         r=rank,
         lora_alpha=alpha,
         lora_dropout=dropout,
-        target_modules=LORA_TARGETS,
+        # PEFT accepts either the "all-linear" sentinel (expands to every Linear
+        # except the LM head, incl. the MLP — OpenVLA's recipe) or an explicit
+        # list of module-name suffixes. Requires peft>=0.10 (pinned 0.11.1).
+        target_modules=lora_targets,
         bias="none",
         task_type="CAUSAL_LM",
     )

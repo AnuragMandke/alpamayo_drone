@@ -8,6 +8,13 @@ model:
     rank: 32
     alpha: 64
     dropout: 0.0
+    # LoRA target modules. all-linear = attention (q/k/v/o) + MLP (gate/up/down),
+    # OpenVLA's official finetuning recipe. Attention-only ([q_proj, k_proj,
+    # v_proj, o_proj]) starves the transfer arm and is the prime suspect for a
+    # run stalling at the marginal-loss floor. Swap to that list to run the
+    # attention-only-vs-all-linear ablation. Applies to ALL arms so they stay
+    # matched. Raises trainable params ~33.5M -> ~110M.
+    targets: all-linear
 
 data:
   dataset_root: "data/uzh_fpv"
@@ -29,22 +36,45 @@ data:
                               # 0.0339s (29.5Hz), so ~0.27s nominal — BUT UZH-FPV
                               # drops frames (dt p90 = 0.0657s, ~2x), so this is a
                               # VARIABLE time horizon: the worst observed 8-frame
-                              # window spans 0.43s. poses.npy carries no timestamps
-                              # to correct for it, so the target has an irreducible
-                              # noise floor. It hits all three arms equally, so the
-                              # ablation comparison stays valid — but it caps how
-                              # low any arm's loss can go. Fixing it needs the
-                              # converter to emit per-frame timestamps.
+                              # window spans 0.43s. This caps how low any arm's
+                              # loss can go (it hits all arms equally, so the
+                              # comparison stays valid). Used only when
+                              # waypoint_horizon_seconds is unset.
+
+  # Fixed-TIME waypoint horizon (seconds). Set this to target the pose nearest N
+  # seconds ahead on the GT clock instead of a fixed frame count — the frame-drop
+  # fix. 0.27 = 8 frames x the 0.0339s median dt, so it matches the nominal
+  # lookahead without the variable-time noise. REQUIRES timestamps.npy: re-run
+  # scripts/convert_uzh_fpv.py (it now emits them) and re-tar/re-upload the data.
+  # ENABLED for the lab run (2026-09-05): all 118 converted trajectories now carry
+  # timestamps.npy, so the better-posed target costs nothing. Measured floors on
+  # the full train split: fixed-frame 2.563 nats, fixed-time 2.590 nats — read
+  # this run against 2.590. Comment this line out to fall back to the fixed-frame
+  # target (older data, or to reproduce the 2.201-nats T4 probe exactly).
+  waypoint_horizon_seconds: 0.27
 
 training:
   output_dir: "outputs/openvla"
   seed: 42
   epochs: 5                   # OpenVLA finetunes converge fast; tune on lab GPU
-  batch_size: 8               # per-step; raise on a 24-40GB GPU. NOTE: the
-                              # scratch arm keeps a bf16 (~14GB) base vs the
-                              # pretrained arm's 4-bit base, so it needs >=24GB
-                              # or a smaller batch_size than the pretrained run.
+  batch_size: 8               # per-step, for the 4-bit pretrained arm.
   gradient_accumulation_steps: 2
+
+  # Per-arm memory shape (24GB card: RTX 3090/4090). The pretrained arm runs on a
+  # ~5GB 4-bit base; scratch and prismatic each hold a full ~14GB bf16 backbone
+  # (gradient-checkpointed, but the weights are unavoidable), and prismatic adds a
+  # second vision tower (DINOv2 + SigLIP), so they need a smaller per-step batch.
+  # The EFFECTIVE batch (batch_size x grad_accum) must stay 16 on every arm — the
+  # arms may differ only in backbone init — and resolve_arm_training_cfg() raises
+  # if an override changes the product. Only these two keys may be overridden.
+  # If an arm OOMs, halve its batch_size and double its accum (16 -> 1x16 is fine).
+  per_arm:
+    scratch:
+      batch_size: 4
+      gradient_accumulation_steps: 4
+    prismatic:
+      batch_size: 2
+      gradient_accumulation_steps: 8
   max_grad_norm: 1.0
   optimizer:
     lr: 5.0e-4                # OpenVLA LoRA finetuning default

@@ -36,6 +36,10 @@ def parse_args():
     p.add_argument("--init", choices=["pretrained", "scratch", "prismatic"],
                    default="pretrained")
     p.add_argument("--device", default=None)
+    p.add_argument("--max-steps", type=int, default=None,
+                   help="Stop after N optimizer steps, overriding training.max_steps. "
+                        "Use for a pre-flight smoke of the REAL config (catches OOM/"
+                        "dtype faults in minutes instead of hours) without forking it.")
     return p.parse_args()
 
 
@@ -65,7 +69,7 @@ def main():
 
     from models.openvla_policy import (
         build_openvla_policy, build_prismatic_policy, trainable_parameters,
-        resolve_amp,
+        resolve_amp, resolve_arm_training_cfg,
     )
     from models.action_tokenizer import ActionTokenizer
     from data.openvla_dataset import (
@@ -73,18 +77,29 @@ def main():
         make_openvla_collate, make_prismatic_collate, marginal_loss_floor,
     )
 
+    # Per-arm batch/accum shape (a 24GB card needs a smaller per-step batch for
+    # the bf16 arms than for the 4-bit one); the effective batch stays matched.
+    tc = resolve_arm_training_cfg(tc, args.init)
     amp_dtype, amp_enabled = resolve_amp(tc)
     print(f"[Train] precision={amp_dtype} (autocast={'on' if amp_enabled else 'off'})")
+    print(f"[Train] batch_size={tc['batch_size']} x grad_accum="
+          f"{tc['gradient_accumulation_steps']} -> effective batch "
+          f"{tc['batch_size'] * tc['gradient_accumulation_steps']} "
+          f"(must match across arms)")
 
     is_prismatic = args.init == "prismatic"
 
     # ---- Model + processor ------------------------------------------------
+    # LoRA target modules: "all-linear" (OpenVLA's recipe, the default) or an
+    # explicit list to sweep attention-only vs all-linear from config.
+    lora_targets = mc["lora"].get("targets", "all-linear")
     processor = image_transform = None
     if is_prismatic:
         model, tokenizer, image_transform = build_prismatic_policy(
             lora_rank=mc["lora"]["rank"],
             lora_alpha=mc["lora"]["alpha"],
             lora_dropout=mc["lora"]["dropout"],
+            lora_targets=lora_targets,
         )
         model = model.to(device)
     else:
@@ -94,6 +109,7 @@ def main():
             lora_rank=mc["lora"]["rank"],
             lora_alpha=mc["lora"]["alpha"],
             lora_dropout=mc["lora"]["dropout"],
+            lora_targets=lora_targets,
             compute_dtype=amp_dtype,
         )
         if args.init == "scratch":
@@ -105,13 +121,23 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     target_mode = dc.get("target_mode", "velocity")
     waypoint_horizon = dc.get("waypoint_horizon", 8)
+    # Optional fixed-TIME waypoint horizon (seconds). When set, the target is the
+    # pose nearest this many seconds ahead (needs timestamps.npy) instead of a
+    # fixed frame count — removes the variable-time-horizon target noise.
+    waypoint_horizon_seconds = dc.get("waypoint_horizon_seconds")
     stats = compute_drone_norm_stats(
         dc["dataset_root"], dc["train_split"], tc["seed"],
         target_mode=target_mode, waypoint_horizon=waypoint_horizon,
+        waypoint_horizon_seconds=waypoint_horizon_seconds,
     )
     json.dump(stats, open(out_dir / "drone_norm_stats.json", "w"), indent=2)
-    print(f"[Train] target_mode={target_mode}"
-          + (f" horizon={waypoint_horizon}" if target_mode == "waypoint" else ""))
+    if target_mode == "waypoint":
+        horizon_desc = (f"{waypoint_horizon_seconds}s"
+                        if waypoint_horizon_seconds is not None
+                        else f"{waypoint_horizon} frames")
+        print(f"[Train] target_mode=waypoint horizon={horizon_desc}")
+    else:
+        print(f"[Train] target_mode={target_mode}")
 
     # Print the yardstick for reading the loss BEFORE any of it scrolls past: a
     # model that ignores the image and predicts the marginal action distribution
@@ -119,6 +145,7 @@ def main():
     floor, H = marginal_loss_floor(
         dc["dataset_root"], stats, dc["train_split"], tc["seed"],
         target_mode=target_mode, waypoint_horizon=waypoint_horizon,
+        waypoint_horizon_seconds=waypoint_horizon_seconds,
     )
     print(f"[Train] marginal-only loss floor = {floor:.3f} nats "
           f"— a model ignoring the image scores this; below it = using the image")
@@ -133,6 +160,7 @@ def main():
             split="train", train_split=dc["train_split"], seed=tc["seed"],
             predict_offset=dc["predict_offset"],
             target_mode=target_mode, waypoint_horizon=waypoint_horizon,
+            waypoint_horizon_seconds=waypoint_horizon_seconds,
         )
         collate = make_prismatic_collate(pad_id)
     else:
@@ -141,6 +169,7 @@ def main():
             train_split=dc["train_split"], seed=tc["seed"],
             predict_offset=dc["predict_offset"],
             target_mode=target_mode, waypoint_horizon=waypoint_horizon,
+            waypoint_horizon_seconds=waypoint_horizon_seconds,
         )
         collate = make_openvla_collate(pad_id)
     loader = DataLoader(
@@ -158,8 +187,9 @@ def main():
     # fp16 needs loss scaling to avoid gradient underflow; bf16/fp32 do not, and
     # GradScaler(enabled=False) is a transparent no-op so the loop stays uniform.
     scaler = torch.cuda.amp.GradScaler(enabled=(amp_dtype == torch.float16))
-    # Optional smoke cap: stop after this many optimizer steps (Colab/Kaggle T4).
-    max_steps = tc.get("max_steps")
+    # Optional smoke cap: stop after this many optimizer steps (Colab/Kaggle T4,
+    # or a --max-steps pre-flight of the lab config).
+    max_steps = args.max_steps or tc.get("max_steps")
 
     # ---- Train ------------------------------------------------------------
     model.train()
