@@ -30,6 +30,11 @@ bitsandbytes>=0.43.0          # 4-bit QLoRA to fit smaller GPUs; kept current on
                               # purpose — it is a compiled CUDA lib and needs to
                               # match the host's driver, unlike the two above
 numpy>=1.26.0
+scipy>=1.11.0                 # quaternion -> body-frame rotation in the waypoint
+                              # target path (data/openvla_dataset.py) and the
+                              # converter. NOT optional: waypoint mode is the
+                              # default target, so a missing scipy crashes the
+                              # first batch, after the 15GB weight download.
 Pillow>=10.0.0
 PyYAML>=6.0
 # flash-attn>=2.5.0           # optional, Linux/CUDA only — big speedup, skip on Windows
