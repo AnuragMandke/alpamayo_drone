@@ -179,7 +179,8 @@ Each timestep becomes one supervised example in OpenVLA's native format:
 - **Labels:** prompt positions masked (-100); only the action tokens + EOS are
   supervised.
 - **Loss:** `model(**batch).loss` — OpenVLA's own next-token cross-entropy over
-  the action-token positions. We reuse its action head verbatim.
+  the action-token positions. The action head is OpenVLA's own, carried over
+  with its pretrained weights (and LoRA-adapted from there — see §5.2).
 
 ### 5.1 Action tokenization and the 4→7-DoF mapping
 
@@ -216,13 +217,37 @@ right experiment — the thesis is about *lightweight* finetuning, and LoRA touc
 <1% of parameters.
 
 - **Pretrained arm:** 4-bit NF4 QLoRA (double-quantized), fits a 16 GB GPU.
-- **LoRA targets = `all-linear`** (attention q/k/v/o **plus** the MLP
-  gate/up/down), OpenVLA's official recipe. This was changed from attention-only
-  (`q/k/v/o_proj`) because attention-only starves the transfer arm of capacity
-  and was the prime suspect for a run stalling at the marginal floor. It is now a
+- **LoRA targets = `all-linear`**, OpenVLA's official recipe (their finetuning
+  script passes the same sentinel over the whole model). Changed from
+  attention-only (`q/k/v/o_proj`), which starves the transfer arm of capacity and
+  was the prime suspect for a run stalling at the marginal floor. It is now a
   **config knob** (`model.lora.targets`) so the attention-only-vs-all-linear
   question can itself be run as an ablation without code edits. Cost: trainable
-  params rise ~33.5M → ~110M.
+  params rise ~33.5M → ~110.8M (1.45% of 7.65B).
+
+  **What `all-linear` actually resolves to here** (read off `adapter_config.json`
+  from the first lab run, 2026-09-07 — it is broader than the name suggests):
+
+  ```
+  LLM:     q_proj k_proj v_proj o_proj gate_proj up_proj down_proj
+  Vision:  qkv kv q proj fc1 fc2 fc3          (DINOv2 + SigLIP towers)
+  Head:    lm_head                            (the action head itself)
+  ```
+
+  PEFT normally excludes the output layer by consulting
+  `get_output_embeddings()`; OpenVLA's `trust_remote_code` wrapper does not
+  expose it in the way PEFT expects, so `lm_head` is targeted and PEFT sets
+  `save_embedding_layers=True` — which is why a checkpoint is ~763 MB (~440 MB
+  adapters + the saved embedding matrices) rather than ~440 MB.
+
+  **Consequence for the claim.** The action head is *not* reused frozen: it is
+  initialized from OpenVLA's pretrained action-token weights and then adapted.
+  The thesis is unaffected, because it is a claim about what the backbone is
+  initialized from, and that is precisely what the three arms isolate — every
+  arm gets the identical LoRA target set, so the comparison is clean. It does
+  make the controls stronger (a `scratch` arm that can adapt its readout is a
+  harder baseline than one stuck with a frozen random head), which is the right
+  direction for a result meant to survive review.
 
 **Why config-driven rather than just flipping the constant?** Because "which
 modules to LoRA" is a legitimate experimental variable, and hardcoding it would

@@ -132,6 +132,13 @@ neutral dims plus EOS, so never compare arms on the loss curve alone.
 - **OpenVLA ≫ Prismatic ≈ scratch** → the gain is *robot* pretraining. Supports the claim.
 - **OpenVLA ≈ Prismatic ≫ scratch** → the gain is generic VL features. Falsifies the framing.
 
+### Disk
+
+Each checkpoint is ~763 MB (`all-linear` targets `lm_head`, so PEFT saves the
+embedding matrices alongside the adapters). At `save_every_n_epochs: 1` that is
+~3.8 GB per arm, ~11.5 GB for all three. Check the volume has room before the
+runs, or raise `save_every_n_epochs` to keep fewer.
+
 ## 7. What to watch while it runs
 
 | Signal | Reading |
