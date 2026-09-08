@@ -56,7 +56,16 @@ data:
 training:
   output_dir: "outputs/openvla"
   seed: 42
-  epochs: 5                   # OpenVLA finetunes converge fast; tune on lab GPU
+  epochs: 3                   # Was 5. The lab pretrained arm reached epoch 3 at
+                              # ~72 min/epoch with means 2.087 / 1.846 / 1.768 —
+                              # already 0.82 below the 2.590 floor and flattening.
+                              # There is NO LR scheduler in the train loop, so the
+                              # first 3 epochs of a 5-epoch run are identical to a
+                              # planned 3-epoch run: that arm is complete, not
+                              # truncated. All arms run 3 and are scored at epoch 3;
+                              # matched epochs across arms is what the comparison
+                              # needs, not depth. Raise this only if you re-run
+                              # every arm.
   batch_size: 8               # per-step, for the 4-bit pretrained arm.
   gradient_accumulation_steps: 2
 
