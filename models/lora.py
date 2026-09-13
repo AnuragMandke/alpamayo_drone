@@ -74,15 +74,26 @@ def inject_lora(
     rank: int,
     alpha: float,
     dropout: float = 0.0,
+    include_lm_head: bool = False,
 ) -> nn.Module:
     """
     Walk the model, replace every Linear whose name ends with one of
     `target_modules` with a LoRALinear.
 
     `target_modules` is either a list of name suffixes (e.g. ["q_proj", ...]) or
-    the string "all-linear" — every Linear except the LM head, mirroring PEFT's
-    sentinel so the hand-rolled (Prismatic) and PEFT (OpenVLA) arms take the same
-    recipe from one config value.
+    the string "all-linear" — every Linear, excluding the LM head unless
+    `include_lm_head` is set.
+
+    `include_lm_head` exists because PEFT's "all-linear" is NOT uniform across
+    our arms. PEFT normally skips the output embedding by consulting
+    `get_output_embeddings()`; OpenVLA's trust_remote_code wrapper does not
+    expose it the way PEFT expects, so on the pretrained/scratch arms PEFT DOES
+    adapt `lm_head` (which is why those checkpoints are ~763MB — see commit
+    6139ca9). Leaving it skipped here would hand the Prismatic control ~28%
+    fewer trainable parameters AND a frozen action head while the other two arms
+    adapt theirs — handicapping the control biases the OpenVLA-vs-Prismatic gap
+    toward confirming the transfer claim. Pass include_lm_head=True on the
+    Prismatic arm so the three arms differ only in initialization.
 
     Freezes ALL base parameters first, then marks LoRA params as trainable.
     """
@@ -102,9 +113,9 @@ def inject_lora(
         if not isinstance(module, nn.Linear):
             continue
         if all_linear:
-            # Skip the tied output projection, as PEFT's all-linear does — LoRA on
-            # the LM head is both unusual and can destabilize the vocab logits.
-            if name.split(".")[-1] == "lm_head":
+            # Skip the tied output projection unless the caller matches an arm
+            # where PEFT did adapt it (see include_lm_head in the docstring).
+            if name.split(".")[-1] == "lm_head" and not include_lm_head:
                 continue
         elif not any(name.endswith(t) for t in target_modules):
             continue

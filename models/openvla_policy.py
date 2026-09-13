@@ -220,20 +220,24 @@ def build_prismatic_policy(
 
     vlm = load(PRISMATIC_ID).to(torch.bfloat16)
 
-    # Parity with the OpenVLA arm: freeze EVERYTHING (vision backbone, projector,
-    # LM head), then inject LoRA into the LLM attention only. inject_lora itself
-    # freezes the llm base and unfreezes only the LoRA A/B matrices, but we must
-    # first freeze the vision backbone + projector (separate submodules) too.
-    for p in vlm.parameters():
-        p.requires_grad_(False)
-    # NOTE: this LoRAs the LLM linears only (the vision backbone + projector are
-    # frozen submodules). PEFT's "all-linear" on the OpenVLA/scratch arms targets
-    # linears across the whole VLA, so verify the two arms' LoRA footprints match
-    # closely enough on the lab GPU before reading the pretrained-vs-Prismatic gap.
+    # Parity with the OpenVLA arm. This MUST walk the whole VLM, not just the
+    # LLM: PEFT's "all-linear" on the OpenVLA/scratch arms targets linears across
+    # the entire VLA — LLM projections, the DINOv2/SigLIP towers, the projector,
+    # AND lm_head (commit 6139ca9) — for 110,828,288 trainable params. Injecting
+    # into `vlm.llm_backbone.llm` alone (as this did until 2026-09-13) gave the
+    # control ~80M and a FROZEN action head, i.e. it handicapped the arm whose
+    # job is to be a fair control. That biases the OpenVLA-vs-Prismatic gap
+    # toward confirming the transfer claim — the one direction a reader will
+    # check. The arms must differ only in initialization.
+    #
+    # inject_lora freezes every base param first and unfreezes only the LoRA
+    # A/B matrices, so passing the whole VLM covers the vision backbone and
+    # projector that used to need a separate freeze pass.
     inject_lora(
-        vlm.llm_backbone.llm,
+        vlm,
         target_modules=lora_targets,
         rank=lora_rank, alpha=lora_alpha, dropout=lora_dropout,
+        include_lm_head=True,
     )
 
     # Gradient-checkpoint through the frozen ~14GB bf16 base; input_require_grads
@@ -245,10 +249,17 @@ def build_prismatic_policy(
         llm.enable_input_require_grads()
 
     s = count_trainable_params(vlm)
-    print(f"[Prismatic] {PRISMATIC_ID} + LoRA(r={lora_rank}) — "
+    print(f"[Prismatic] {PRISMATIC_ID} + LoRA(r={lora_rank}, targets={lora_targets}) — "
           f"VL-pretrained / robot-naive control arm")
     print(f"[Prismatic] trainable {s['trainable']:,} / {s['total']:,} "
           f"({s['pct_trainable']:.2f}%)")
+    # The other two arms print exactly 110,828,288. A large gap here means the
+    # arms differ in capacity as well as init, and the headline gap is confounded.
+    for part in ("vision_backbone", "projector", "llm_backbone"):
+        sub = getattr(vlm, part, None)
+        if sub is not None:
+            n = sum(p.numel() for p in sub.parameters() if p.requires_grad)
+            print(f"[Prismatic]   {part}: {n:,} trainable")
 
     tokenizer = vlm.llm_backbone.get_tokenizer()
     image_transform = vlm.vision_backbone.get_image_transform()
