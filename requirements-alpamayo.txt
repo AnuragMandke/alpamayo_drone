@@ -1,0 +1,27 @@
+# Alpamayo probe environment — MUST be a separate venv from .venv-openvla.
+#
+# This is not a preference. OpenVLA's trust_remote_code files target
+# transformers 4.40.x (hard-pinned in requirements-openvla.txt, and a newer
+# accelerate breaks its 4-bit load), while Alpamayo requires transformers
+# >=4.57.1 and torch >=2.8. The two cannot share an interpreter.
+#
+#   python -m venv .venv-alpamayo && source .venv-alpamayo/bin/activate
+#   pip install -r requirements-alpamayo.txt
+#
+# The upstream project installs with `uv sync` from github.com/NVlabs/alpamayo.
+# Prefer that for the model package itself; these are the floors this probe
+# needs on top of it.
+
+torch>=2.8.0
+transformers>=4.57.1
+accelerate>=1.0.0
+huggingface_hub>=0.26.0
+
+numpy>=1.26.0
+scipy>=1.11.0          # quaternion -> rotation matrix for the ego history
+Pillow>=10.0.0
+
+# The model package itself. Installed from source; it brings its own pins.
+#   pip install git+https://github.com/NVlabs/alpamayo
+# DeepSpeed (>=0.17.4) is listed by the model card; the probe does inference
+# only and may not need it. Install it if the import path demands it.
