@@ -173,7 +173,10 @@ def main():
     metrics["ckpt"] = str(args.ckpt)
 
     print(f"\n[Eval] init={args.init}  ckpt={args.ckpt}")
-    print(f"  action_token_accuracy : {metrics['action_token_accuracy']:.4f}")
+    print(f"  action_token_accuracy : {metrics['action_token_accuracy']:.4f}"
+          f"  (4 real drone dims; chance ~0.0039)")
+    print(f"  ..._all7              : {metrics['action_token_accuracy_all7']:.4f}"
+          f"  (diluted by 3 constant dims; floor 3/7=0.4286)")
     print(f"  action_l2             : {metrics['action_l2']:.4f}")
     print(f"  val_loss              : {metrics['val_loss']:.4f}"
           f"  (vs the marginal floor the trainer prints)")

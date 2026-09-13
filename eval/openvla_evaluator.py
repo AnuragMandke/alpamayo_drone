@@ -5,7 +5,13 @@ compared on.
 
 Teacher-forced: one forward per batch, argmax at the 7 action-token positions.
 Reports, on the val split:
-    - action_token_accuracy : top-1 over the 7 action tokens (quantization-free)
+    - action_token_accuracy : top-1 over the 4 REAL drone dims (quantization-free).
+                              Scored on dims [0,1,2,5] only: drone_to_openvla
+                              writes constant zeros into roll/pitch/gripper, so
+                              including those 3 free tokens puts every arm just
+                              above 3/7=0.4286 and roughly halves the gap between
+                              arms. action_token_accuracy_all7 keeps the diluted
+                              number for reference.
     - action_l2             : mean per-sample L2 of the 4-DoF drone action error
     - per_dim_mae           : MAE for [vx, vy, vz, yaw_rate], physical units
     - val_loss              : teacher-forced loss on held-out data, directly
@@ -41,16 +47,21 @@ def _score_tokens(p_ids, g_ids, action_tokenizer, norm_stats):
     """Score one sample's 7 action tokens.
 
     p_ids, g_ids: (7,) predicted / gold action-token ids (numpy int).
-    Returns (n_token_correct:int, abs_err:(4,) float, l2:float) where the errors
-    are in physical drone units [vx, vy, vz, yaw_rate].
+    Returns (n_drone_correct:int, n_all_correct:int, abs_err:(4,) float,
+    l2:float) where the errors are in physical drone units.
+
+    n_drone_correct counts ONLY dims [0,1,2,5]. The other three are held at a
+    constant neutral bin, so counting them rewards every arm equally for free
+    and shrinks the between-arm gap the ablation exists to measure.
     """
-    n_correct = int((p_ids == g_ids).sum())
+    n_correct = int((p_ids[DRONE_TO_OPENVLA_IDX] == g_ids[DRONE_TO_OPENVLA_IDX]).sum())
+    n_correct_all = int((p_ids == g_ids).sum())
     p_norm7 = action_tokenizer.decode_token_ids_to_actions(p_ids)   # (7,) in [-1,1]
     g_norm7 = action_tokenizer.decode_token_ids_to_actions(g_ids)
     p_phys = denormalize_action(p_norm7[DRONE_TO_OPENVLA_IDX], norm_stats)  # (4,)
     g_phys = denormalize_action(g_norm7[DRONE_TO_OPENVLA_IDX], norm_stats)
     err = np.abs(p_phys - g_phys).astype(np.float64)
-    return n_correct, err, float(np.linalg.norm(p_phys - g_phys))
+    return n_correct, n_correct_all, err, float(np.linalg.norm(p_phys - g_phys))
 
 
 @torch.no_grad()
@@ -65,6 +76,7 @@ def evaluate_openvla(model, loader, action_tokenizer, norm_stats, device,
     model.eval()
     n_dims = len(DRONE_TO_OPENVLA_IDX)
     tok_correct = tok_total = 0
+    tok_correct_all = tok_total_all = 0
     abs_err_sum = np.zeros(n_dims, dtype=np.float64)
     l2_sum = 0.0
     loss_sum = 0.0
@@ -124,9 +136,12 @@ def evaluate_openvla(model, loader, action_tokenizer, norm_stats, device,
             p_ids = pred[b, act_pos].cpu().numpy()
             g_ids = gold[b, act_pos].cpu().numpy()
 
-            n_corr, err, l2 = _score_tokens(p_ids, g_ids, action_tokenizer, norm_stats)
+            n_corr, n_corr_all, err, l2 = _score_tokens(
+                p_ids, g_ids, action_tokenizer, norm_stats)
             tok_correct += n_corr
-            tok_total += n_action_tokens
+            tok_total += n_dims
+            tok_correct_all += n_corr_all
+            tok_total_all += n_action_tokens
             abs_err_sum += err
             l2_sum += l2
             n_samples += 1
@@ -134,6 +149,7 @@ def evaluate_openvla(model, loader, action_tokenizer, norm_stats, device,
     n = max(n_samples, 1)
     return {
         "action_token_accuracy": tok_correct / max(tok_total, 1),
+        "action_token_accuracy_all7": tok_correct_all / max(tok_total_all, 1),
         "action_l2": l2_sum / n,
         "val_loss": loss_sum / n,
         "per_dim_mae": {

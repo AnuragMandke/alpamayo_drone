@@ -134,9 +134,9 @@ def main():
 
 
 def _print_table(results):
-    print(f"\n{'Arm':<12}{'TokenAcc':>10}{'ActionL2':>10}{'ValLoss':>9}"
+    print(f"\n{'Arm':<12}{'TokenAcc':>10}{'ActionL2':>10}{'ValLoss':>9}{'Acc7':>8}"
           f"{'vx':>8}{'vy':>8}{'vz':>8}{'yaw':>8}{'N':>8}")
-    print("-" * 81)
+    print("-" * 89)
     for arm in ARMS:
         if arm not in results:
             continue
@@ -144,6 +144,7 @@ def _print_table(results):
         pdm = r["per_dim_mae"]
         print(f"{arm:<12}{r[METRIC]:>10.4f}{r['action_l2']:>10.4f}"
               f"{r.get('val_loss', float('nan')):>9.4f}"
+              f"{r.get('action_token_accuracy_all7', float('nan')):>8.4f}"
               f"{pdm['vx']:>8.3f}{pdm['vy']:>8.3f}{pdm['vz']:>8.3f}"
               f"{pdm['yaw_rate']:>8.3f}{r['n_samples']:>8}")
 

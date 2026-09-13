@@ -36,8 +36,9 @@ def _tokens_for(action4):
 def test_perfect_prediction_zero_error():
     atok = ActionTokenizer(FakeTokenizer())
     ids = _tokens_for([2.0, -1.0, 0.5, 1.0])
-    n_correct, err, l2 = _score_tokens(ids, ids, atok, STATS)
-    assert n_correct == 7, n_correct
+    n_correct, n_all, err, l2 = _score_tokens(ids, ids, atok, STATS)
+    assert n_correct == 4, n_correct          # 4 real drone dims
+    assert n_all == 7, n_all
     # Identical tokens decode identically -> exactly zero error.
     assert l2 == 0.0 and np.allclose(err, 0.0), (err, l2)
     print(f"[ok] perfect prediction: acc 7/7, l2={l2:.4f}")
@@ -48,14 +49,16 @@ def test_one_bin_offset_small_bounded_error():
     g = _tokens_for([2.0, -1.0, 0.5, 1.0])
     p = g.copy()
     p[0] = g[0] - 1   # shift the x/vx token by one bin (ids decrease as value rises)
-    n_correct, err, l2 = _score_tokens(p, g, atok, STATS)
-    assert n_correct == 6, n_correct
+    n_correct, n_all, err, l2 = _score_tokens(p, g, atok, STATS)
+    assert n_correct == 3, n_correct      # 3 of the 4 real dims
+    assert n_all == 6, n_all
     # Only vx differs; its error is ~one bin in physical units, others zero.
     vx_bin = (STATS["q99"][0] - STATS["q01"][0]) * (2.0 / 255) / 2.0
     assert err[0] <= (STATS["q99"][0] - STATS["q01"][0]) / 255 + 1e-6, err
     assert np.allclose(err[1:], 0.0), err
     assert l2 > 0.0
-    print(f"[ok] one-bin offset: acc 6/7, vx_err={err[0]:.4f} (~bin {vx_bin:.4f})")
+    print(f"[ok] one-bin offset: acc 3/4 real dims (6/7 all), "
+          f"vx_err={err[0]:.4f} (~bin {vx_bin:.4f})")
 
 
 def test_neutral_dims_do_not_affect_drone_error():
@@ -65,10 +68,14 @@ def test_neutral_dims_do_not_affect_drone_error():
     g = _tokens_for([2.0, -1.0, 0.5, 1.0])
     p = g.copy()
     p[3] = g[3] - 10   # roll token (non-drone dim)
-    n_correct, err, l2 = _score_tokens(p, g, atok, STATS)
+    n_correct, n_all, err, l2 = _score_tokens(p, g, atok, STATS)
     assert np.allclose(err, 0.0) and l2 == 0.0, (err, l2)
-    assert n_correct == 6   # token acc still counts the corrupted position
-    print("[ok] corrupting a neutral (non-drone) dim leaves drone error at zero")
+    # THE POINT OF THE HEADLINE METRIC: a corrupted neutral dim must not move
+    # action_token_accuracy at all. The diluted all-7 count still drops to 6.
+    assert n_correct == 4, n_correct
+    assert n_all == 6, n_all
+    print("[ok] corrupting a neutral (non-drone) dim leaves BOTH drone error "
+          "and real-dim token accuracy untouched")
 
 
 # ---------------------------------------------------------------------------
