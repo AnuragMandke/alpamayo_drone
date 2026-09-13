@@ -32,8 +32,30 @@
 # has drifted past what the model's code expects — pin it down before debugging
 # anything else, the same way requirements-openvla.txt pins 4.40.1.
 #
-# NOTE: alpamayo_r1 depends on flash-attn, which compiles from source and wants
-# nvcc plus several GB of scratch. Set TMPDIR onto the NAS first (see below) or
+# INSTALL ORDER MATTERS — alpamayo_r1 depends on flash-attn, whose setup.py
+# imports torch at BUILD time. pip's build isolation hands it a fresh env with
+# no torch, so a plain `pip install git+...` dies with:
+#     ModuleNotFoundError: No module named 'torch'
+# ...while "getting requirements to build wheel" for flash-attn. Install torch
+# first, then flash-attn with isolation off, then the model package:
+#
+#   nvidia-smi | head -4          # read the driver's CUDA version
+#   pip install "torch>=2.8,<2.10" --index-url https://download.pytorch.org/whl/cu128
+#   python -c "import torch; print(torch.cuda.is_available())"   # must be True
+#   MAX_JOBS=4 pip install flash-attn --no-build-isolation       # 20-60 min
+#   pip install git+https://github.com/NVlabs/alpamayo --no-build-isolation
+#
+# MAX_JOBS caps parallel nvcc; unbounded it eats tens of GB of RAM, and this is
+# a shared machine. Prebuilt wheels (matching torch/CUDA/cp312/cxx11abi) at
+# github.com/Dao-AILab/flash-attention/releases skip the compile entirely.
+#
+# Worth checking before committing an hour to the build: flash-attn is a
+# declared dependency that the INFERENCE path may not actually import.
+#   pip install git+https://github.com/NVlabs/alpamayo --no-deps --no-build-isolation
+#   pip install colorlog einops transformers accelerate
+#   python -c "from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1; print('ok')"
+#
+# flash-attn also needs real scratch space — set TMPDIR onto the NAS (below) or
 # the build dies with [Errno 28] partway through.
 #
 # ---------------------------------------------------------------------------
