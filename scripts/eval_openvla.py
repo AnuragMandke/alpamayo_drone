@@ -175,6 +175,8 @@ def main():
     print(f"\n[Eval] init={args.init}  ckpt={args.ckpt}")
     print(f"  action_token_accuracy : {metrics['action_token_accuracy']:.4f}")
     print(f"  action_l2             : {metrics['action_l2']:.4f}")
+    print(f"  val_loss              : {metrics['val_loss']:.4f}"
+          f"  (vs the marginal floor the trainer prints)")
     pdm = metrics["per_dim_mae"]
     print(f"  per_dim_mae           : vx={pdm['vx']:.4f} vy={pdm['vy']:.4f} "
           f"vz={pdm['vz']:.4f} yaw_rate={pdm['yaw_rate']:.4f}")

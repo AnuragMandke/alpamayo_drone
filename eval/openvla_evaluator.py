@@ -8,6 +8,8 @@ Reports, on the val split:
     - action_token_accuracy : top-1 over the 7 action tokens (quantization-free)
     - action_l2             : mean per-sample L2 of the 4-DoF drone action error
     - per_dim_mae           : MAE for [vx, vy, vz, yaw_rate], physical units
+    - val_loss              : teacher-forced loss on held-out data, directly
+                              comparable to the marginal floor the trainer prints
 
 Both predicted and gold tokens are decoded through the DRONE q01/q99 stats
 (data.openvla_dataset.denormalize_action), NOT OpenVLA's built-in predict_action
@@ -65,7 +67,9 @@ def evaluate_openvla(model, loader, action_tokenizer, norm_stats, device,
     tok_correct = tok_total = 0
     abs_err_sum = np.zeros(n_dims, dtype=np.float64)
     l2_sum = 0.0
+    loss_sum = 0.0
     n_samples = 0
+    offset_reported = False
 
     for batch in loader:
         batch = _move(batch, device, amp_dtype)
@@ -77,13 +81,42 @@ def evaluate_openvla(model, loader, action_tokenizer, norm_stats, device,
                 pixel_values=batch["pixel_values"],
                 labels=batch["labels"],
             )
-        logits = out.logits.float()              # (B, T, V)
-        labels = batch["labels"]                 # (B, T)
+        logits = out.logits.float()              # (B, T_out, V)
+        labels = batch["labels"]                 # (B, T_txt)
+
+        # Prismatic splices its image-patch embeddings INTO the sequence, so its
+        # logits run T_txt + n_patches (286 vs 30 here) while labels stay on the
+        # text stream. The HF OpenVLA path returns logits already aligned to
+        # input_ids, i.e. offset 0, which is why only the prismatic arm was hit.
+        # Without this correction the shift below reads predictions out of the
+        # image-patch region: it scored that arm at exactly 0.0000 token accuracy
+        # — below the ~1/256 chance rate — while it was training to a healthy
+        # loss. Patches sit ahead of every supervised position, so dropping the
+        # leading `offset` predictions re-aligns the two tails.
+        offset = logits.shape[1] - labels.shape[1]
+        if offset < 0:
+            raise ValueError(
+                f"logits ({logits.shape[1]}) shorter than labels "
+                f"({labels.shape[1]}); the scorer cannot align them")
+        if offset and not offset_reported:
+            print(f"[Eval] logits are {offset} longer than labels "
+                  f"(spliced image patches) — realigning before scoring")
+            offset_reported = True
 
         # Causal shift: logits[:, i] predicts the token at labels[:, i+1].
-        pred = logits[:, :-1].argmax(-1)         # (B, T-1)
-        gold = labels[:, 1:]                     # (B, T-1)
+        pred = logits[:, :-1].argmax(-1)[:, offset:]   # (B, T_txt-1)
+        gold = labels[:, 1:]                           # (B, T_txt-1)
+        if pred.shape[1] != gold.shape[1]:
+            raise ValueError(
+                f"alignment failed: pred {pred.shape[1]} vs gold {gold.shape[1]}")
         mask = gold != -100                      # supervised = 7 action tokens + EOS
+
+        # Teacher-forced loss on the val split. Alignment-independent (the model
+        # computes it internally), directly comparable to the marginal floor the
+        # trainer prints, and measured on held-out data — so it is the number
+        # that separates learning from memorization.
+        if getattr(out, "loss", None) is not None:
+            loss_sum += float(out.loss) * gold.shape[0]
 
         for b in range(gold.shape[0]):
             pos = mask[b].nonzero(as_tuple=True)[0]      # contiguous: a0..a6, eos
@@ -102,6 +135,7 @@ def evaluate_openvla(model, loader, action_tokenizer, norm_stats, device,
     return {
         "action_token_accuracy": tok_correct / max(tok_total, 1),
         "action_l2": l2_sum / n,
+        "val_loss": loss_sum / n,
         "per_dim_mae": {
             "vx": abs_err_sum[0] / n,
             "vy": abs_err_sum[1] / n,
