@@ -2,26 +2,57 @@
 #
 # This is not a preference. OpenVLA's trust_remote_code files target
 # transformers 4.40.x (hard-pinned in requirements-openvla.txt, and a newer
-# accelerate breaks its 4-bit load), while Alpamayo requires transformers
-# >=4.57.1 and torch >=2.8. The two cannot share an interpreter.
+# accelerate breaks its 4-bit load), while Alpamayo needs the 4.57 era and
+# torch >=2.8. The two cannot share an interpreter.
 #
-#   python -m venv .venv-alpamayo && source .venv-alpamayo/bin/activate
-#   pip install -r requirements-alpamayo.txt
+# ---------------------------------------------------------------------------
+# DO NOT install torch / transformers / accelerate from here.
+# ---------------------------------------------------------------------------
+# An earlier version of this file floored them (`transformers>=4.57.1`,
+# `torch>=2.8`). pip resolved that to transformers 5.17.0 and torch 2.14 with
+# CUDA 13 wheels — i.e. it reproduced, in a brand new venv, the exact
+# transformers-5.x skew that makes OpenVLA's remote code fail, and pulled a CUDA
+# stack that need not match the host driver. Version skew of precisely this kind
+# already cost this project a 15GB download (see docs/DESIGN.md §7).
 #
-# The upstream project installs with `uv sync` from github.com/NVlabs/alpamayo.
-# Prefer that for the model package itself; these are the floors this probe
-# needs on top of it.
+# The upstream project (github.com/NVlabs/alpamayo) ships a lockfile with the
+# versions it was actually tested against. Let IT own the heavy stack:
+#
+#   pip install git+https://github.com/NVlabs/alpamayo      # brings its own pins
+#
+# or, closer to what upstream documents:
+#
+#   uv venv .venv-alpamayo && source .venv-alpamayo/bin/activate && uv sync
+#
+# Then verify before trusting anything:
+#
+#   python -c "import torch, transformers; print(torch.__version__, transformers.__version__)"
+#
+# transformers should land in the 4.57.x era. If it reports 5.x, the resolver
+# has drifted past what the model's code expects — pin it down before debugging
+# anything else, the same way requirements-openvla.txt pins 4.40.1.
+#
+# NOTE: alpamayo_r1 depends on flash-attn, which compiles from source and wants
+# nvcc plus several GB of scratch. Set TMPDIR onto the NAS first (see below) or
+# the build dies with [Errno 28] partway through.
+#
+# ---------------------------------------------------------------------------
+# DISK: set these BEFORE any pip command on this box
+# ---------------------------------------------------------------------------
+#   source /media/nas_mount/AnuragMandke/env.sh
+# which must export at least:
+#   export TMPDIR=/media/nas_mount/AnuragMandke/tmp
+#   export PIP_CACHE_DIR=/media/nas_mount/AnuragMandke/pip-cache
+#   export HF_HOME=/media/nas_mount/AnuragMandke/hf
+# `/` and the shared home /home/research2 are both too small; pip defaults to
+# both and fails with [Errno 28] No space left on device.
+#
+# ---------------------------------------------------------------------------
+# What this file actually installs: only what scripts/probe_alpamayo.py needs
+# on top of the model package.
+# ---------------------------------------------------------------------------
 
-torch>=2.8.0
-transformers>=4.57.1
-accelerate>=1.0.0
-huggingface_hub>=0.26.0
-
-numpy>=1.26.0
+numpy                  # version follows whatever torch/alpamayo pulled in
 scipy>=1.11.0          # quaternion -> rotation matrix for the ego history
-Pillow>=10.0.0
-
-# The model package itself. Installed from source; it brings its own pins.
-#   pip install git+https://github.com/NVlabs/alpamayo
-# DeepSpeed (>=0.17.4) is listed by the model card; the probe does inference
-# only and may not need it. Install it if the import path demands it.
+Pillow>=10.0.0         # frame loading
+PyYAML>=6.0            # reads configs/openvla.yaml for the val split
