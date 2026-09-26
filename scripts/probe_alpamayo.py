@@ -20,9 +20,10 @@ kind, not just in weights:
      if predicted z is ~0 everywhere, the dz component of our target is
      structurally unreachable and any L2 including it is unfair by construction.
 
-  3. INPUT. Alpamayo expects FOUR cameras (front-wide, front-tele, cross-left,
-     cross-right) plus 0.4 s of egomotion history. UZH-FPV has ONE forward
-     camera. This probe replicates that frame across all four mounts, which is
+  3. INPUT. Alpamayo expects FOUR cameras (cross-left, front-wide,
+     cross-right, front-tele) x FOUR frames each (t0-0.3s .. t0) plus 1.6 s of
+     egomotion history. UZH-FPV has ONE forward camera. This probe feeds the
+     real 4-frame clip from that camera to all four mounts, which is
      off-distribution and is the single biggest caveat on any number below.
      The ego history, at least, is real: poses.npy + timestamps.npy give it to
      us exactly.
@@ -43,10 +44,10 @@ first; it is the `--max-steps 20` of this pipeline.
     python scripts/probe_alpamayo.py --inspect
     python scripts/probe_alpamayo.py --n-samples 200
 
-UNVALIDATED: the call signature below is transcribed from NVlabs/alpamayo's
-src/alpamayo_r1/test_inference.py and the HF model card. It has NOT been run
-against real weights from this repo. --inspect exists precisely to find out
-where it is wrong before a long run does.
+Inputs follow NVlabs/alpamayo at commit 11a0e01 (test_inference.py, helper.py,
+load_physical_aiavdataset.py). An earlier version guessed the API from the model
+card and died at AutoProcessor: the checkpoint ships no processor files. Run
+--inspect after any upstream bump before trusting a long run.
 """
 
 import argparse
@@ -66,11 +67,16 @@ from data.openvla_dataset import _body_frame_delta, waypoint_target_index
 
 ALPAMAYO_ID = "nvidia/Alpamayo-R1-10B"
 
-# Alpamayo's four camera mounts, in the order the processor expects.
-CAMERAS = ["front_wide", "front_tele", "cross_left", "cross_right"]
+# Input layout, from upstream src/alpamayo_r1/load_physical_aiavdataset.py
+# (commit 11a0e01): cameras sorted cross_left, front_wide, cross_right,
+# front_tele; 4 frames per camera at t0-0.3s .. t0; flattened camera-major.
+N_CAMERAS = 4
+FRAMES_PER_CAMERA = 4
+FRAME_DT = 0.1
 
-# Ego history: 0.4 s at 10 Hz, per the model card.
-EGO_HISTORY_SECONDS = 0.4
+# Ego history: 16 steps at 10 Hz = 1.6 s ending at t0, same source. The prompt
+# reserves 48 <|traj_history|> tokens for it, so the count is not negotiable.
+EGO_HISTORY_STEPS = 16
 EGO_HISTORY_HZ = 10
 
 # Output trajectory: 64 waypoints over 6.4 s => 0.1 s spacing.
@@ -89,7 +95,6 @@ def parse_args():
                    help="Stage 1: one sample, print every shape, then stop.")
     p.add_argument("--horizon", type=float, default=0.27,
                    help="Match the other arms' fixed-time waypoint target.")
-    p.add_argument("--instruction", default="Fly forward through the course.")
     p.add_argument("--out", default="outputs/alpamayo/probe_alpamayo.json")
     return p.parse_args()
 
@@ -113,7 +118,7 @@ def val_trajectories(root, train_split, seed):
 
 
 def ego_history(poses, timestamps, t):
-    """(N,3) positions and (N,3,3) rotations over the last EGO_HISTORY_SECONDS,
+    """(N,3) positions and (N,3,3) rotations over the last EGO_HISTORY_STEPS,
     expressed in the ego frame at time t (so the last entry is the origin /
     identity). Returns (None, None) if the history runs off the start of the clip.
 
@@ -123,7 +128,7 @@ def ego_history(poses, timestamps, t):
     """
     from scipy.spatial.transform import Rotation
 
-    n = int(EGO_HISTORY_SECONDS * EGO_HISTORY_HZ)          # 4 samples
+    n = EGO_HISTORY_STEPS
     want = timestamps[t] - np.arange(n - 1, -1, -1) / EGO_HISTORY_HZ
     if want[0] < timestamps[0]:
         return None, None                                   # not enough history
@@ -134,6 +139,18 @@ def ego_history(poses, timestamps, t):
     xyz = np.stack([R_t_inv.apply(poses[i, :3] - poses[t, :3]) for i in idx])
     rot = np.stack([(R_t_inv * R[i]).as_matrix() for i in idx])
     return xyz.astype(np.float32), rot.astype(np.float32)
+
+
+def clip_frames(traj_dir, timestamps, t):
+    """uint8 (FRAMES_PER_CAMERA, 3, H, W) at t0-0.3s .. t0, picked by CLOCK
+    TIME like ego_history. None if the clip starts too late."""
+    want = timestamps[t] - np.arange(FRAMES_PER_CAMERA - 1, -1, -1) * FRAME_DT
+    if want[0] < timestamps[0]:
+        return None
+    idx = [int(np.argmin(np.abs(timestamps - w))) for w in want]
+    frames = [np.asarray(Image.open(traj_dir / "images" / f"rgb_{i:03d}.png")
+                         .convert("RGB")) for i in idx]
+    return torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).contiguous()
 
 
 def gt_future(poses, timestamps, t, horizons):
@@ -151,7 +168,9 @@ def gt_future(poses, timestamps, t, horizons):
 # ---------------------------------------------------------------------------
 
 def load_alpamayo(model_id, device):
-    """Transcribed from NVlabs/alpamayo src/alpamayo_r1/test_inference.py.
+    """Follows NVlabs/alpamayo src/alpamayo_r1/test_inference.py (commit
+    11a0e01). The checkpoint ships no processor files: upstream builds one from
+    Qwen3-VL-2B-Instruct and swaps in the model's own tokenizer.
     Import errors here are the expected first failure — they mean the model
     package is not installed (pip install git+https://github.com/NVlabs/alpamayo)
     or you are in .venv-openvla instead of .venv-alpamayo."""
@@ -164,37 +183,38 @@ def load_alpamayo(model_id, device):
             "4.40.1; Alpamayo needs >=4.57.1 — they cannot share an env.)\n"
             "  - Install: pip install git+https://github.com/NVlabs/alpamayo"
         )
-    from transformers import AutoProcessor
+    from alpamayo_r1 import helper
 
     model = AlpamayoR1.from_pretrained(model_id, dtype=torch.bfloat16).to(device)
     model.eval()
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    processor = helper.get_processor(model.tokenizer)
     return model, processor
 
 
-def build_inputs(processor, image, instruction, ego_xyz, ego_rot, device):
-    """Four camera mounts from ONE drone frame.
+def build_inputs(processor, frames, ego_xyz, ego_rot, device):
+    """Four camera mounts from ONE drone camera's 4-frame clip.
 
     This is the probe's biggest caveat: Alpamayo was trained on a real 4-camera
     rig with genuine cross-view parallax, and we are handing it the same forward
-    image four times. Any negative result is therefore ambiguous between "the
+    clip four times. The prompt is upstream's fixed training prompt — there is
+    no free-text instruction to set. Any negative result is therefore ambiguous between "the
     driving prior does not transfer" and "we fed it an input it has never seen".
     A positive result, by contrast, is meaningful despite this.
     """
-    content = [{"type": "image", "image": image, "camera": cam} for cam in CAMERAS]
-    content.append({"type": "text", "text": instruction})
-    messages = [{"role": "user", "content": content}]
+    from alpamayo_r1 import helper
+
+    image_frames = frames[None].expand(N_CAMERAS, *frames.shape)   # (cams, T, 3, H, W)
+    messages = helper.create_message(image_frames.flatten(0, 1))
 
     tokenized = processor.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=True,
-        return_dict=True, return_tensors="pt",
-    ).to(device)
-
-    return {
+        messages, tokenize=True, add_generation_prompt=False,
+        continue_final_message=True, return_dict=True, return_tensors="pt",
+    )
+    return helper.to_device({
         "tokenized_data": tokenized,
-        "ego_history_xyz": torch.from_numpy(ego_xyz)[None].to(device),
-        "ego_history_rot": torch.from_numpy(ego_rot)[None].to(device),
-    }
+        "ego_history_xyz": torch.from_numpy(ego_xyz)[None, None],   # (1,1,16,3)
+        "ego_history_rot": torch.from_numpy(ego_rot)[None, None],   # (1,1,16,3,3)
+    }, device)
 
 
 def predict(model, model_inputs):
@@ -233,6 +253,7 @@ def main():
 
     model, processor = load_alpamayo(args.model_id, device)
     print(f"[Probe] loaded {args.model_id}")
+    torch.cuda.manual_seed_all(tc["seed"])   # trajectory sampling is stochastic
 
     # Candidate (traj, frame) samples that have a valid lookahead at the matched
     # horizon. Ego-history availability is checked per sample below.
@@ -261,14 +282,16 @@ def main():
         ego_xyz, ego_rot = ego_history(poses, ts, t)
         if ego_xyz is None:
             continue
-        img = Image.open(tp / "images" / f"rgb_{t:03d}.png").convert("RGB")
+        frames = clip_frames(tp, ts, t)
+        if frames is None:
+            continue
 
-        mi = build_inputs(processor, img, args.instruction, ego_xyz, ego_rot, device)
+        mi = build_inputs(processor, frames, ego_xyz, ego_rot, device)
         pred_xyz, pred_rot, extra = predict(model, mi)
 
         if args.inspect:
             print("\n================ STAGE 1: shapes ================")
-            print(f"  image                : {img.size}")
+            print(f"  frames (per camera)  : {tuple(frames.shape)} x {N_CAMERAS} cameras")
             print(f"  ego_history_xyz      : {tuple(mi['ego_history_xyz'].shape)}")
             print(f"  ego_history_rot      : {tuple(mi['ego_history_rot'].shape)}")
             tk = mi["tokenized_data"]
@@ -286,9 +309,9 @@ def main():
             gt = gt_future(poses, ts, t, [args.horizon])[0]
             print(f"  GT body-frame @ {args.horizon}s : {np.round(gt, 3)} "
                   f"[dx, dy, dz, dyaw]")
-            cot = (extra or {}).get("cot") if isinstance(extra, dict) else None
-            if cot:
-                print(f"  reasoning trace      : {str(cot)[:400]}")
+            cot = extra.get("cot") if isinstance(extra, dict) else None
+            if cot is not None:
+                print(f"  reasoning trace      : {str(cot[0])[:400]}")
             print("\nCHECK BEFORE TRUSTING ANY NUMBER:")
             print("  * Does pred_xyz's frame match our body frame (x forward)?")
             print("    Compare the signs above against the GT row.")
@@ -342,7 +365,7 @@ def main():
         "pred_abs_z_max_mean": float(np.mean(z_pred)),
         "per_axis_corr_pred_vs_gt": {"x": corr[0], "y": corr[1], "z": corr[2]},
         "caveats": [
-            "single forward camera replicated to 4 mounts (off-distribution)",
+            "single forward camera clip replicated to 4 mounts (off-distribution)",
             "zero-shot, no drone finetuning",
             "unicycle output model may not express vertical motion",
         ],
