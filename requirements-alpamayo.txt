@@ -15,45 +15,44 @@
 # stack that need not match the host driver. Version skew of precisely this kind
 # already cost this project a 15GB download (see docs/DESIGN.md §7).
 #
-# The upstream project (github.com/NVlabs/alpamayo) ships a lockfile with the
-# versions it was actually tested against. Let IT own the heavy stack:
+# Upstream (github.com/NVlabs/alpamayo) declares exact pins for the heavy
+# stack. Install THOSE versions explicitly, in the order below — do not let a
+# bare `pip install git+https://github.com/NVlabs/alpamayo` resolve them, and do
+# not `pip install transformers` unpinned (that is how 5.17.0 got in).
 #
-#   pip install git+https://github.com/NVlabs/alpamayo      # brings its own pins
+# transformers must report 4.57.1. If it reports 5.x, pin it down before
+# debugging anything else, the same way requirements-openvla.txt pins 4.40.1.
 #
-# or, closer to what upstream documents:
+# VERIFIED INSTALL (lab box, 2026-09-26) — import of AlpamayoR1 succeeds.
+# Upstream's own metadata pins torch==2.8.0 and transformers==4.57.1 EXACTLY
+# (python -c "import importlib.metadata as m; print(m.requires('alpamayo_r1'))").
+# Match them; a `>=` range here previously let pip land on torch 2.9.1 and,
+# via an unpinned `pip install transformers`, on transformers 5.17.0.
 #
-#   uv venv .venv-alpamayo && source .venv-alpamayo/bin/activate && uv sync
-#
-# Then verify before trusting anything:
-#
-#   python -c "import torch, transformers; print(torch.__version__, transformers.__version__)"
-#
-# transformers should land in the 4.57.x era. If it reports 5.x, the resolver
-# has drifted past what the model's code expects — pin it down before debugging
-# anything else, the same way requirements-openvla.txt pins 4.40.1.
-#
-# INSTALL ORDER MATTERS — alpamayo_r1 depends on flash-attn, whose setup.py
-# imports torch at BUILD time. pip's build isolation hands it a fresh env with
-# no torch, so a plain `pip install git+...` dies with:
-#     ModuleNotFoundError: No module named 'torch'
-# ...while "getting requirements to build wheel" for flash-attn. Install torch
-# first, then flash-attn with isolation off, then the model package:
-#
-#   nvidia-smi | head -4          # read the driver's CUDA version
-#   pip install "torch>=2.8,<2.10" --index-url https://download.pytorch.org/whl/cu128
+#   python3 -m venv .venv-alpamayo && source .venv-alpamayo/bin/activate
+#   pip install "torch==2.8.0" "torchvision==0.23.0" --index-url https://download.pytorch.org/whl/cu128
 #   python -c "import torch; print(torch.cuda.is_available())"   # must be True
-#   MAX_JOBS=4 pip install flash-attn --no-build-isolation       # 20-60 min
-#   pip install git+https://github.com/NVlabs/alpamayo --no-build-isolation
-#
-# MAX_JOBS caps parallel nvcc; unbounded it eats tens of GB of RAM, and this is
-# a shared machine. Prebuilt wheels (matching torch/CUDA/cp312/cxx11abi) at
-# github.com/Dao-AILab/flash-attention/releases skip the compile entirely.
-#
-# Worth checking before committing an hour to the build: flash-attn is a
-# declared dependency that the INFERENCE path may not actually import.
+#   pip install "transformers==4.57.1" "accelerate<1.11"
+#   pip install hatchling editables hatch-vcs    # build backend; needed because
+#                                                # --no-build-isolation uses THIS env
 #   pip install git+https://github.com/NVlabs/alpamayo --no-deps --no-build-isolation
-#   pip install colorlog einops transformers accelerate
+#   pip freeze | grep -i -E "^(torch|torchvision|transformers|accelerate|numpy)==" > $TMPDIR/pins.txt
+#   pip install colorlog "einops>=0.8.1" "hydra-core>=1.3.2" "physical-ai-av>=0.2.0" -c $TMPDIR/pins.txt
+#   pip install -r requirements-alpamayo.txt -c $TMPDIR/pins.txt
 #   python -c "from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1; print('ok')"
+#
+# --no-deps is deliberate: never let pip resolve alpamayo_r1's dependency list
+# on its own — it drifts transformers/torch. The -c pins file makes any
+# dependency that wants a different torch/transformers FAIL instead of silently
+# upgrading.
+#
+# flash-attn (declared, >=2.8.3) is NOT needed for the import above. Install it
+# only if model load / --inspect fails on flash_attn. Prefer the prebuilt wheel:
+#   python -c "import torch; print(torch._C._GLIBCXX_USE_CXX11_ABI)"
+#   pip install --no-deps https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+# (abiFALSE if the check prints False.) Compiling instead needs torch installed
+# first, --no-build-isolation, and MAX_JOBS=4 (unbounded nvcc eats tens of GB of
+# RAM on a shared machine); 20-60 min.
 #
 # flash-attn also needs real scratch space — set TMPDIR onto the NAS (below) or
 # the build dies with [Errno 28] partway through.
