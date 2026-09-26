@@ -42,7 +42,18 @@ Stage 1 validates the API against ONE sample and prints every shape. Run it
 first; it is the `--max-steps 20` of this pipeline.
 
     python scripts/probe_alpamayo.py --inspect
-    python scripts/probe_alpamayo.py --n-samples 200
+    python scripts/probe_alpamayo.py --n-samples 200 --ego-frame velocity
+    python scripts/probe_alpamayo.py --n-samples 200 --ego-frame velocity --images blank
+
+EGO FRAME MATTERS MORE THAN ANYTHING ELSE HERE. The first run (--ego-frame
+body) scored 0.67 m 3D against 0.26 m for constant velocity — but a no-vision
+fake that just goes straight at its current speed scores 0.61 m in that same
+frame. The drone flies tilted ~23 deg (median) and sideslips ~28 deg off its
+body-x heading; a unicycle can express neither. --ego-frame velocity hands the
+model a level virtual car pointing along the direction of travel, and the same
+fake drops to ~0.24 m. Only a gap between Alpamayo and constant velocity IN THAT
+FRAME says anything about the driving prior. --images blank then says whether
+any of it comes from vision.
 
 Inputs follow NVlabs/alpamayo at commit 11a0e01 (test_inference.py, helper.py,
 load_physical_aiavdataset.py). An earlier version guessed the API from the model
@@ -63,7 +74,7 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data.openvla_dataset import _body_frame_delta, waypoint_target_index
+from data.openvla_dataset import waypoint_target_index
 
 ALPAMAYO_ID = "nvidia/Alpamayo-R1-10B"
 
@@ -95,7 +106,23 @@ def parse_args():
                    help="Stage 1: one sample, print every shape, then stop.")
     p.add_argument("--horizon", type=float, default=0.27,
                    help="Match the other arms' fixed-time waypoint target.")
-    p.add_argument("--out", default="outputs/alpamayo/probe_alpamayo.json")
+    p.add_argument("--ego-frame", choices=["body", "level", "velocity"],
+                   default="body",
+                   help="Frame Alpamayo's ego history is expressed in (and its "
+                        "prediction read back from). body = the drone's full "
+                        "attitude (tilted ~23 deg median, the original probe). "
+                        "level = gravity-aligned, heading of body x. velocity = "
+                        "gravity-aligned, heading along the direction of travel: "
+                        "a virtual car following the drone's horizontal path, "
+                        "which removes the sideslip a unicycle cannot express.")
+    p.add_argument("--images", choices=["real", "blank"], default="real",
+                   help="blank = all-black frames: if L2 barely moves, the "
+                        "prediction comes from the ego history, not from vision.")
+    p.add_argument("--traj-samples", type=int, default=1,
+                   help="Average this many sampled trajectories (the MEAN, not "
+                        "best-of-K: picking the one nearest GT would peek).")
+    p.add_argument("--out", default=None,
+                   help="Default: outputs/alpamayo/probe_<frame>_<images>_k<K>.json")
     return p.parse_args()
 
 
@@ -117,28 +144,61 @@ def val_trajectories(root, train_split, seed):
     return [trajs[i] for i in idx[n_train:]]
 
 
-def ego_history(poses, timestamps, t):
-    """(N,3) positions and (N,3,3) rotations over the last EGO_HISTORY_STEPS,
-    expressed in the ego frame at time t (so the last entry is the origin /
-    identity). Returns (None, None) if the history runs off the start of the clip.
-
-    Frames are picked by CLOCK TIME, not frame count — UZH-FPV drops frames, and
-    a fixed frame count would give a variable-duration history. Same reasoning as
-    waypoint_horizon_seconds in the main pipeline.
-    """
-    from scipy.spatial.transform import Rotation
-
-    n = EGO_HISTORY_STEPS
-    want = timestamps[t] - np.arange(n - 1, -1, -1) / EGO_HISTORY_HZ
+def history_index(timestamps, t):
+    """Frame indices for the EGO_HISTORY_STEPS samples ending at t, picked by
+    CLOCK TIME, not frame count — UZH-FPV drops frames, and a fixed frame count
+    would give a variable-duration history. None if it runs off the clip start."""
+    want = timestamps[t] - np.arange(EGO_HISTORY_STEPS - 1, -1, -1) / EGO_HISTORY_HZ
     if want[0] < timestamps[0]:
-        return None, None                                   # not enough history
-    idx = [int(np.argmin(np.abs(timestamps - w))) for w in want]
+        return None
+    return [int(np.argmin(np.abs(timestamps - w))) for w in want]
 
-    R = Rotation.from_quat(poses[:, 3:7])
-    R_t_inv = R[t].inv()
-    xyz = np.stack([R_t_inv.apply(poses[i, :3] - poses[t, :3]) for i in idx])
-    rot = np.stack([(R_t_inv * R[i]).as_matrix() for i in idx])
-    return xyz.astype(np.float32), rot.astype(np.float32)
+
+def _yaw_rot(yaw):
+    from scipy.spatial.transform import Rotation
+    return Rotation.from_euler("z", yaw)
+
+
+def _heading_of(R):
+    """Heading (rad) of body x projected onto the world horizontal plane."""
+    fx = R.apply([1.0, 0.0, 0.0])
+    fx = np.atleast_2d(fx)
+    return np.arctan2(fx[:, 1], fx[:, 0])
+
+
+def ego_frame(poses, idx, mode):
+    """Rotation world<-F of the frame Alpamayo sees at t0 (= idx[-1]), plus the
+    per-step rotations of its ego history expressed in F.
+
+    body     : F = the drone's full attitude. History rotations = R_F^-1 R_i.
+    level    : F = yaw-only, heading of body x. Each history step is a level
+               "car" with that step's body-x heading.
+    velocity : F = yaw-only, heading along horizontal velocity. Each history
+               step is a level car pointing where the drone was going — no
+               sideslip, which is the only motion a unicycle can express.
+    In every mode the last history rotation is the identity, as upstream's
+    loader produces for a real car."""
+    from scipy.spatial.transform import Rotation
+    R_all = Rotation.from_quat(poses[idx, 3:7])
+    if mode == "body":
+        R_F = R_all[-1]
+        return R_F, (R_F.inv() * R_all).as_matrix()
+    if mode == "level":
+        yaw = _heading_of(R_all)
+    else:
+        xyz = poses[idx, :3]
+        v = np.gradient(xyz, 1.0 / EGO_HISTORY_HZ, axis=0)
+        yaw = np.arctan2(v[:, 1], v[:, 0])
+        slow = np.linalg.norm(v[:, :2], axis=1) < 0.3   # heading undefined
+        yaw[slow] = _heading_of(R_all)[slow]
+    R_F = _yaw_rot(yaw[-1])
+    return R_F, np.stack([_yaw_rot(y - yaw[-1]).as_matrix() for y in yaw])
+
+
+def ego_history(poses, idx, R_F):
+    """History positions in frame F, origin at t0 (last entry = 0)."""
+    xyz = R_F.inv().apply(poses[idx, :3] - poses[idx[-1], :3])
+    return xyz.astype(np.float32)
 
 
 def clip_frames(traj_dir, timestamps, t):
@@ -153,24 +213,13 @@ def clip_frames(traj_dir, timestamps, t):
     return torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).contiguous()
 
 
-def constant_velocity(ego_xyz, horizon, window=2):
-    """The no-vision baseline Alpamayo has to beat. ego_xyz is in the t0 frame
-    with the last entry at the origin, so the mean velocity over the last
-    `window` steps is -ego_xyz[-1-window] / (window * dt). Alpamayo sees this
-    same history, so matching it on forward motion alone proves nothing about
-    the driving prior; only beating it does."""
-    v = -ego_xyz[-1 - window] / (window / EGO_HISTORY_HZ)
+def constant_velocity(poses, idx, horizon, window=2):
+    """The no-vision baseline Alpamayo has to beat: world-frame displacement
+    from extrapolating the mean velocity over the last `window` history steps.
+    Alpamayo sees this same history, so matching it on forward motion alone
+    proves nothing about the driving prior; only beating it does."""
+    v = (poses[idx[-1], :3] - poses[idx[-1 - window], :3]) / (window / EGO_HISTORY_HZ)
     return v * horizon
-
-
-def gt_future(poses, timestamps, t, horizons):
-    """Body-frame [dx,dy,dz,dyaw] at each horizon in `horizons` (seconds).
-    None entries where the clip ends before that horizon."""
-    out = []
-    for h in horizons:
-        j = waypoint_target_index(timestamps, t, h)
-        out.append(None if j is None else _body_frame_delta(poses, t, j))
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +251,7 @@ def load_alpamayo(model_id, device):
 
 
 def build_inputs(processor, frames, ego_xyz, ego_rot, device):
+    # ego_rot: (16,3,3) float32 in the same frame as ego_xyz
     """Four camera mounts from ONE drone camera's 4-frame clip.
 
     This is the probe's biggest caveat: Alpamayo was trained on a real 4-camera
@@ -223,29 +273,27 @@ def build_inputs(processor, frames, ego_xyz, ego_rot, device):
     return helper.to_device({
         "tokenized_data": tokenized,
         "ego_history_xyz": torch.from_numpy(ego_xyz)[None, None],   # (1,1,16,3)
-        "ego_history_rot": torch.from_numpy(ego_rot)[None, None],   # (1,1,16,3,3)
+        "ego_history_rot": torch.from_numpy(ego_rot.astype(np.float32))[None, None],
     }, device)
 
 
-def predict(model, model_inputs):
+def predict(model, model_inputs, k=1):
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         pred_xyz, pred_rot, extra = model.sample_trajectories_from_data_with_vlm_rollout(
             data=model_inputs,
             top_p=0.98,
             temperature=0.6,
-            num_traj_samples=1,
+            num_traj_samples=k,
             max_generation_length=256,
             return_extra=True,
         )
     return pred_xyz, pred_rot, extra
 
 
-def first_trajectory(pred_xyz):
-    """[B, n_sets, n_samples, T, 3] -> (T, 3) for the first sample."""
+def mean_trajectory(pred_xyz):
+    """[B, n_sets, n_samples, T, 3] -> (T, 3), mean over samples."""
     a = pred_xyz.float().cpu().numpy()
-    while a.ndim > 2:
-        a = a[0]
-    return a
+    return a[0, 0].mean(axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -265,40 +313,60 @@ def main():
     print(f"[Probe] loaded {args.model_id}")
     torch.cuda.manual_seed_all(tc["seed"])   # trajectory sampling is stochastic
 
-    # Candidate (traj, frame) samples that have a valid lookahead at the matched
-    # horizon. Ego-history availability is checked per sample below.
+    # Candidate (traj, frame) samples with BOTH a valid lookahead at the matched
+    # horizon and a full 1.6 s history, filtered up front so --n-samples is the
+    # number actually scored (the first run silently scored 129 of 200).
     cands = []
     for tp in trajs:
         if not (tp / "poses.npy").exists() or not (tp / "timestamps.npy").exists():
             continue
         ts = np.load(tp / "timestamps.npy")
         for t in range(len(ts)):
-            if waypoint_target_index(ts, t, args.horizon) is not None:
+            if (waypoint_target_index(ts, t, args.horizon) is not None
+                    and history_index(ts, t) is not None):
                 cands.append((tp, t))
     if not cands:
         raise SystemExit(
-            "No val frames have a valid lookahead. Check that timestamps.npy "
-            "exists (re-run scripts/convert_uzh_fpv.py).")
+            "No val frames have a valid lookahead and history. Check that "
+            "timestamps.npy exists (re-run scripts/convert_uzh_fpv.py).")
     random.Random(tc["seed"]).shuffle(cands)
     n = 1 if args.inspect else min(args.n_samples, len(cands))
-    print(f"[Probe] {len(cands)} candidate frames; using {n}")
+    print(f"[Probe] {len(cands)} candidate frames; using {n}  "
+          f"(ego-frame={args.ego_frame}, images={args.images}, "
+          f"traj-samples={args.traj_samples})")
 
-    rows, z_pred, l2_matched, l2_planar = [], [], [], []
-    cv_3d, cv_planar = [], []
+    from scipy.spatial.transform import Rotation
+    rows = []
+    k = args.horizon / TRAJ_DT - 1.0            # Alpamayo's grid starts at +0.1 s
+    k0, k1 = int(np.floor(k)), int(np.ceil(k))
+    w = float(k - k0)
 
     for i in range(n):
         tp, t = cands[i]
         poses = np.load(tp / "poses.npy")
         ts = np.load(tp / "timestamps.npy")
-        ego_xyz, ego_rot = ego_history(poses, ts, t)
-        if ego_xyz is None:
-            continue
+        idx = history_index(ts, t)
+        R_F, ego_rot = ego_frame(poses, idx, args.ego_frame)
+        ego_xyz = ego_history(poses, idx, R_F)
         frames = clip_frames(tp, ts, t)
-        if frames is None:
-            continue
+        if args.images == "blank":
+            frames = torch.zeros_like(frames)
 
         mi = build_inputs(processor, frames, ego_xyz, ego_rot, device)
-        pred_xyz, pred_rot, extra = predict(model, mi)
+        pred_xyz, pred_rot, extra = predict(model, mi, args.traj_samples)
+        traj = mean_trajectory(pred_xyz)                 # (64, 3) in frame F
+        p_F = traj[k0] * (1 - w) + traj[k1] * w
+
+        # Everything is scored as a WORLD displacement from t0, so the choice of
+        # frame changes what Alpamayo sees but not the yardstick. 3D L2 is
+        # frame-invariant; "horizontal" is the gravity plane, which is where a
+        # planar driving model's output lives.
+        j = waypoint_target_index(ts, t, args.horizon)
+        gt_w = poses[j, :3] - poses[t, :3]
+        pred_w = R_F.apply(p_F)
+        cv_w = constant_velocity(poses, idx, args.horizon)
+        R_t = Rotation.from_quat(poses[t, 3:7])
+        pred_b, gt_b = R_t.inv().apply(pred_w), R_t.inv().apply(gt_w)
 
         if args.inspect:
             print("\n================ STAGE 1: shapes ================")
@@ -306,102 +374,80 @@ def main():
             print(f"  ego_history_xyz      : {tuple(mi['ego_history_xyz'].shape)}")
             print(f"  ego_history_rot      : {tuple(mi['ego_history_rot'].shape)}")
             tk = mi["tokenized_data"]
-            for k, v in (tk.items() if hasattr(tk, "items") else []):
+            for kk, v in (tk.items() if hasattr(tk, "items") else []):
                 if hasattr(v, "shape"):
-                    print(f"  tokenized[{k}]".ljust(24) + f": {tuple(v.shape)}")
+                    print(f"  tokenized[{kk}]".ljust(24) + f": {tuple(v.shape)}")
             print(f"  pred_xyz             : {tuple(pred_xyz.shape)}")
-            print(f"  pred_rot             : {tuple(pred_rot.shape)}")
-            traj = first_trajectory(pred_xyz)
-            print(f"  first trajectory     : {traj.shape}  "
-                  f"(expect ~(64, 3) = 6.4s @ {TRAJ_DT}s)")
-            print(f"  first 4 waypoints    :\n{np.round(traj[:4], 3)}")
-            print(f"  z range over traj    : [{traj[:, 2].min():.3f}, "
-                  f"{traj[:, 2].max():.3f}]  <- ~0 means planar/unicycle only")
-            gt = gt_future(poses, ts, t, [args.horizon])[0]
-            print(f"  GT body-frame @ {args.horizon}s : {np.round(gt, 3)} "
-                  f"[dx, dy, dz, dyaw]")
+            print(f"  history in frame F (last 3):\n{np.round(ego_xyz[-3:], 3)}")
+            print(f"  first 4 waypoints (F):\n{np.round(traj[:4], 3)}")
+            print(f"  pred world @ {args.horizon}s : {np.round(pred_w, 3)}")
+            print(f"  GT   world @ {args.horizon}s : {np.round(gt_w, 3)}")
+            print(f"  CV   world @ {args.horizon}s : {np.round(cv_w, 3)}")
             cot = extra.get("cot") if isinstance(extra, dict) else None
             if cot is not None:
                 print(f"  reasoning trace      : {str(cot[0])[:400]}")
-            print("\nCHECK BEFORE TRUSTING ANY NUMBER:")
-            print("  * Does pred_xyz's frame match our body frame (x forward)?")
-            print("    Compare the signs above against the GT row.")
-            print("  * Is z genuinely predicted, or pinned at 0 (unicycle)?")
-            print("  * Is the trajectory 64 long at 0.1s spacing as documented?")
             return
 
-        traj = first_trajectory(pred_xyz)
-        z_pred.append(float(np.abs(traj[:, 2]).max()))
+        rows.append({
+            "traj": tp.name, "t": int(t),
+            "mount": "down45" if "_45_" in tp.name else "forward",
+            "l2_3d": float(np.linalg.norm(pred_w - gt_w)),
+            "l2_horiz": float(np.linalg.norm(pred_w[:2] - gt_w[:2])),
+            "cv_l2_3d": float(np.linalg.norm(cv_w - gt_w)),
+            "cv_l2_horiz": float(np.linalg.norm(cv_w[:2] - gt_w[:2])),
+            "pred_body": [float(x) for x in pred_b],
+            "gt_body": [float(x) for x in gt_b],
+            "pred_max_abs_z_F": float(np.abs(traj[:, 2]).max()),
+        })
+        if (i + 1) % 25 == 0:
+            print(f"  [{i+1}/{n}] horizontal L2 = "
+                  f"{np.mean([r['l2_horiz'] for r in rows]):.4f} m "
+                  f"(const-vel {np.mean([r['cv_l2_horiz'] for r in rows]):.4f} m)",
+                  flush=True)
 
-        # Matched horizon: linear interpolation on Alpamayo's 0.1s grid.
-        k = args.horizon / TRAJ_DT - 1.0
-        k0 = int(np.clip(np.floor(k), 0, len(traj) - 1))
-        k1 = int(np.clip(np.ceil(k), 0, len(traj) - 1))
-        w = float(k - k0)
-        p = traj[k0] * (1 - w) + traj[k1] * w
-        g = gt_future(poses, ts, t, [args.horizon])[0]
-        if g is not None:
-            l2_matched.append(float(np.linalg.norm(p[:3] - g[:3])))
-            l2_planar.append(float(np.linalg.norm(p[:2] - g[:2])))
-            c = constant_velocity(ego_xyz, args.horizon)
-            cv_3d.append(float(np.linalg.norm(c - g[:3])))
-            cv_planar.append(float(np.linalg.norm(c[:2] - g[:2])))
-            rows.append({"traj": tp.name, "t": t,
-                         "pred_xyz": [float(x) for x in p],
-                         "gt_dxdydz": [float(x) for x in g[:3]],
-                         "gt_dyaw": float(g[3])})
-
-        if (i + 1) % 25 == 0 and l2_planar:
-            print(f"  [{i+1}/{n}] running planar L2 = {np.mean(l2_planar):.4f} m "
-                  f"(const-vel {np.mean(cv_planar):.4f} m)")
-
-    if not l2_matched:
-        raise SystemExit("No scorable samples — every candidate lacked ego history.")
-
-    # Axis-convention diagnostic: if Alpamayo's frame does not match ours, the
-    # correlation between predicted and GT forward motion collapses (or flips
-    # sign). That is a coordinate bug, NOT a transfer result — check it before
-    # concluding anything about the driving prior.
-    P = np.array([r["pred_xyz"] for r in rows])
-    G = np.array([r["gt_dxdydz"] for r in rows])
-    corr = []
-    for d in range(3):
-        if P[:, d].std() < 1e-9 or G[:, d].std() < 1e-9:
-            corr.append(float("nan"))        # constant column (e.g. planar z)
-        else:
-            corr.append(float(np.corrcoef(P[:, d], G[:, d])[0, 1]))
+    def summarize(rs):
+        P = np.array([r["pred_body"] for r in rs])
+        G = np.array([r["gt_body"] for r in rs])
+        corr = [float("nan") if P[:, d].std() < 1e-9 or G[:, d].std() < 1e-9
+                else float(np.corrcoef(P[:, d], G[:, d])[0, 1]) for d in range(3)]
+        m = lambda key: float(np.mean([r[key] for r in rs]))
+        return {"n": len(rs), "l2_3d_m": m("l2_3d"), "l2_horiz_m": m("l2_horiz"),
+                "const_vel_l2_3d_m": m("cv_l2_3d"),
+                "const_vel_l2_horiz_m": m("cv_l2_horiz"),
+                "body_corr_xyz": corr}
 
     res = {
-        "model": args.model_id,
-        "n_scored": len(l2_matched),
-        "horizon_s": args.horizon,
-        "l2_3d_m": float(np.mean(l2_matched)),
-        "l2_planar_m": float(np.mean(l2_planar)),
-        "const_vel_l2_3d_m": float(np.mean(cv_3d)),
-        "const_vel_l2_planar_m": float(np.mean(cv_planar)),
-        "pred_abs_z_max_mean": float(np.mean(z_pred)),
-        "per_axis_corr_pred_vs_gt": {"x": corr[0], "y": corr[1], "z": corr[2]},
+        "model": args.model_id, "horizon_s": args.horizon,
+        "ego_frame": args.ego_frame, "images": args.images,
+        "traj_samples": args.traj_samples,
+        "all": summarize(rows),
+        "by_mount": {mt: summarize([r for r in rows if r["mount"] == mt])
+                     for mt in ("forward", "down45")
+                     if any(r["mount"] == mt for r in rows)},
+        "pred_abs_z_max_mean": float(np.mean([r["pred_max_abs_z_F"] for r in rows])),
         "caveats": [
             "single forward camera clip replicated to 4 mounts (off-distribution)",
             "zero-shot, no drone finetuning",
-            "unicycle output model may not express vertical motion",
+            "8 of 12 val trajectories use the 45-deg-down camera mount",
         ],
     }
     print("\n================ PROBE RESULT ================")
-    print(f"  scored samples        : {res['n_scored']}")
-    print(f"  L2 @ {args.horizon}s (3D)      : {res['l2_3d_m']:.4f} m")
-    print(f"  L2 @ {args.horizon}s (planar)  : {res['l2_planar_m']:.4f} m")
-    print(f"  const-vel baseline    : {res['const_vel_l2_planar_m']:.4f} m planar, "
-          f"{res['const_vel_l2_3d_m']:.4f} m 3D   <- Alpamayo must BEAT this")
-    print(f"  mean max |pred z|     : {res['pred_abs_z_max_mean']:.4f} m"
-          f"   <- ~0 => planar only, dz unreachable")
-    print(f"  corr(pred, gt) x/y/z  : {corr[0]:+.3f} / {corr[1]:+.3f} / {corr[2]:+.3f}")
-    print("  NOTE: a near-zero or negative x-correlation means the coordinate "
-          "frames disagree — fix that before reading L2 as a transfer result.")
+    print(f"  ego-frame={args.ego_frame}  images={args.images}  "
+          f"traj-samples={args.traj_samples}  horizon={args.horizon}s")
+    print(f"  {'subset':<9}{'n':>5}{'L2 3D':>9}{'CV 3D':>9}"
+          f"{'L2 horiz':>10}{'CV horiz':>10}   corr x/y/z (body)")
+    for name, r in [("all", res["all"])] + list(res["by_mount"].items()):
+        c = r["body_corr_xyz"]
+        print(f"  {name:<9}{r['n']:>5}{r['l2_3d_m']:>9.4f}{r['const_vel_l2_3d_m']:>9.4f}"
+              f"{r['l2_horiz_m']:>10.4f}{r['const_vel_l2_horiz_m']:>10.4f}"
+              f"   {c[0]:+.2f} / {c[1]:+.2f} / {c[2]:+.2f}")
+    print(f"  mean max |pred z| in F: {res['pred_abs_z_max_mean']:.4f} m")
+    print("  Alpamayo must BEAT const-vel (CV) to show the driving prior adds anything.")
 
-    out = Path(args.out)
+    out = Path(args.out or f"outputs/alpamayo/probe_{args.ego_frame}_"
+               f"{args.images}_k{args.traj_samples}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
-    json.dump({"summary": res, "samples": rows[:50]}, open(out, "w"), indent=2)
+    json.dump({"summary": res, "samples": rows}, open(out, "w"), indent=2)
     print(f"\n[Probe] Saved -> {out}")
 
 
