@@ -127,12 +127,36 @@ def analyze(path, data_root):
                       f"[{lo:+.4f}, {hi:+.4f}]  {verdict}")
 
 
+def compare_runs(path_a, path_b):
+    """Paired difference between two probe runs on the same samples, e.g.
+    real vs blank images: the direct measure of what vision contributes."""
+    ra = {(r["traj"], r["t"]): r for r in json.load(open(path_a))["samples"]}
+    rb = {(r["traj"], r["t"]): r for r in json.load(open(path_b))["samples"]}
+    keys = sorted(ra.keys() & rb.keys())
+    print(f"\n=== PAIRED: {path_a}  minus  {path_b}  ({len(keys)} shared samples)")
+    for subset in ["all", "forward", "down45"]:
+        ks = [k for k in keys if subset == "all" or ra[k]["mount"] == subset]
+        if not ks:
+            continue
+        g = np.array([k[0] for k in ks])
+        for metric in ["l2_horiz", "l2_3d"]:
+            d = np.array([ra[k][metric] - rb[k][metric] for k in ks])
+            lo, hi = cluster_bootstrap(d, g)
+            print(f"  [{subset:<7}] {metric:<8} diff {d.mean():+.4f} [{lo:+.4f}, {hi:+.4f}]"
+                  f"   mean |per-sample diff| {np.abs(d).mean():.4f}")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("results", nargs="+")
     p.add_argument("--data-root", default=None,
                    help="Default: data.dataset_root from configs/openvla.yaml")
+    p.add_argument("--pair", action="store_true",
+                   help="Also compare the FIRST two result files sample by "
+                        "sample (e.g. images=real vs images=blank).")
     args = p.parse_args()
+    if args.pair and len(args.results) >= 2:
+        compare_runs(*args.results[:2])
     root = args.data_root
     if root is None:
         import yaml
