@@ -153,6 +153,16 @@ def clip_frames(traj_dir, timestamps, t):
     return torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).contiguous()
 
 
+def constant_velocity(ego_xyz, horizon, window=2):
+    """The no-vision baseline Alpamayo has to beat. ego_xyz is in the t0 frame
+    with the last entry at the origin, so the mean velocity over the last
+    `window` steps is -ego_xyz[-1-window] / (window * dt). Alpamayo sees this
+    same history, so matching it on forward motion alone proves nothing about
+    the driving prior; only beating it does."""
+    v = -ego_xyz[-1 - window] / (window / EGO_HISTORY_HZ)
+    return v * horizon
+
+
 def gt_future(poses, timestamps, t, horizons):
     """Body-frame [dx,dy,dz,dyaw] at each horizon in `horizons` (seconds).
     None entries where the clip ends before that horizon."""
@@ -274,6 +284,7 @@ def main():
     print(f"[Probe] {len(cands)} candidate frames; using {n}")
 
     rows, z_pred, l2_matched, l2_planar = [], [], [], []
+    cv_3d, cv_planar = [], []
 
     for i in range(n):
         tp, t = cands[i]
@@ -332,13 +343,17 @@ def main():
         if g is not None:
             l2_matched.append(float(np.linalg.norm(p[:3] - g[:3])))
             l2_planar.append(float(np.linalg.norm(p[:2] - g[:2])))
+            c = constant_velocity(ego_xyz, args.horizon)
+            cv_3d.append(float(np.linalg.norm(c - g[:3])))
+            cv_planar.append(float(np.linalg.norm(c[:2] - g[:2])))
             rows.append({"traj": tp.name, "t": t,
                          "pred_xyz": [float(x) for x in p],
                          "gt_dxdydz": [float(x) for x in g[:3]],
                          "gt_dyaw": float(g[3])})
 
         if (i + 1) % 25 == 0 and l2_planar:
-            print(f"  [{i+1}/{n}] running planar L2 = {np.mean(l2_planar):.4f} m")
+            print(f"  [{i+1}/{n}] running planar L2 = {np.mean(l2_planar):.4f} m "
+                  f"(const-vel {np.mean(cv_planar):.4f} m)")
 
     if not l2_matched:
         raise SystemExit("No scorable samples — every candidate lacked ego history.")
@@ -362,6 +377,8 @@ def main():
         "horizon_s": args.horizon,
         "l2_3d_m": float(np.mean(l2_matched)),
         "l2_planar_m": float(np.mean(l2_planar)),
+        "const_vel_l2_3d_m": float(np.mean(cv_3d)),
+        "const_vel_l2_planar_m": float(np.mean(cv_planar)),
         "pred_abs_z_max_mean": float(np.mean(z_pred)),
         "per_axis_corr_pred_vs_gt": {"x": corr[0], "y": corr[1], "z": corr[2]},
         "caveats": [
@@ -374,6 +391,8 @@ def main():
     print(f"  scored samples        : {res['n_scored']}")
     print(f"  L2 @ {args.horizon}s (3D)      : {res['l2_3d_m']:.4f} m")
     print(f"  L2 @ {args.horizon}s (planar)  : {res['l2_planar_m']:.4f} m")
+    print(f"  const-vel baseline    : {res['const_vel_l2_planar_m']:.4f} m planar, "
+          f"{res['const_vel_l2_3d_m']:.4f} m 3D   <- Alpamayo must BEAT this")
     print(f"  mean max |pred z|     : {res['pred_abs_z_max_mean']:.4f} m"
           f"   <- ~0 => planar only, dz unreachable")
     print(f"  corr(pred, gt) x/y/z  : {corr[0]:+.3f} / {corr[1]:+.3f} / {corr[2]:+.3f}")
